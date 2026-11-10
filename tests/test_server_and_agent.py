@@ -81,6 +81,10 @@ async def test_server_reports_errors_in_words_claude_can_use(tmp_path):
         assert is_error(blocked) and "blocked" in blocked.content[0].text
         unknown = await session.call_tool("manual", {"topic": "cheats"})
         assert is_error(unknown) and "controls" in unknown.content[0].text
+        escape = await session.call_tool("hotkey", {"action": "close"})
+        assert is_error(escape) and "title screen" in escape.content[0].text
+        closed = await session.call_tool("hotkey", {"action": "close", "in_game": True})
+        assert not is_error(closed) and "Pressed escape (close)" in closed.content[0].text
 
 
 async def test_notes_persist_and_manual_reads(tmp_path):

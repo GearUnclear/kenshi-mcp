@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import locale
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,12 @@ from .config import SPEEDS, Config
 from .keys import BlockedInput, char_to_key, check_allowed, check_modifiers, parse_combo, parse_modifiers
 
 HALT_MARKER = "KENSHI_LINK_HALTED"
+_ESCAPE_REFUSED = (
+    "Escape was not sent. On Kenshi's title screen (CONTINUE, NEW GAME, LOAD GAME ...) it quits the "
+    "game without asking, and kenshi-link cannot start it again. If the latest screenshot shows a "
+    "loaded game (the world, or a window over it), use hotkey('close', in_game=true). On the title "
+    "screen, click the open window's own close or cancel button instead."
+)
 
 CAMERA_ACTIONS = (
     "forward",
@@ -60,6 +67,10 @@ _CORNER_ZONE = 3
 # that a click in the corner of a borderless window at the corner of the screen stays
 # clear of it even if it lands a pixel off.
 _EDGE_MARGIN = _CORNER_ZONE + 2
+# Kenshi scrolls its camera for as long as the pointer rests in the outer 1% of its view,
+# over the HUD too and while paused. A click there is allowed, but the pointer is not left
+# there: it is parked this share of the window in from the edge, half as much again.
+_SCROLL_ZONE = 0.015
 
 
 class ControlError(Exception):
@@ -258,6 +269,42 @@ class Controller:
         wy = max(_EDGE_MARGIN, min(info.height - 1 - _EDGE_MARGIN, wy))
         return wx, wy
 
+    def _scroll_margin(self, info: WindowInfo) -> tuple[int, int]:
+        """How far in from the window's edges, each way, the pointer must rest so as not to
+        scroll Kenshi's camera."""
+        return (
+            max(_EDGE_MARGIN, math.ceil(info.width * _SCROLL_ZONE)),
+            max(_EDGE_MARGIN, math.ceil(info.height * _SCROLL_ZONE)),
+        )
+
+    def _off_the_edge(self, info: WindowInfo, wx: int, wy: int) -> tuple[int, int]:
+        """The nearest window point to (wx, wy) that is clear of the edge-scroll zone."""
+        margin_x, margin_y = self._scroll_margin(info)
+        return (
+            max(margin_x, min(info.width - 1 - margin_x, wx)),
+            max(margin_y, min(info.height - 1 - margin_y, wy)),
+        )
+
+    def _leave_edge(self, info: WindowInfo) -> bool:
+        """Move a pointer that is resting on the game window's edge a little way in.
+
+        Left there, it scrolls the camera for as long as it stays, paused or not: the view
+        slides away and the picture keeps changing, which looks like a running game. The
+        ring on the screenshot still marks where the click landed.
+        """
+        try:
+            x, y = self.backend.cursor()
+            wx, wy = x - info.left, y - info.top
+            inside = self._off_the_edge(info, wx, wy)
+            if not (0 <= wx < info.width and 0 <= wy < info.height) or (wx, wy) == inside:
+                return False
+            self._poll()  # the screen's corner is inside this zone: the operator may have put it there
+            self.backend.move(*self._clear_of_corner(info.left + inside[0], info.top + inside[1]))
+        except BackendError as exc:
+            raise self._control_error(exc) from exc
+        self.clock.sleep(self.config.pointer_dwell_seconds)
+        return True
+
     def _shot(
         self, info: WindowInfo, frame: Image.Image | None = None, *, grid: bool = False, mark: bool = False
     ) -> Shot:
@@ -439,6 +486,7 @@ class Controller:
             raise Interrupted("kenshi-link is shutting down; nothing was sent.")
         self._check_halt()
         info = self._window()
+        self._leave_edge(info)  # wherever it was left, by us or by the operator
         self.actions += 1
         return info
 
@@ -565,6 +613,12 @@ class Controller:
         closed, character creation was confirmed) is noticed before the next advance. It is
         left out where the action itself moves the view.
         """
+        info = self._window()
+        if self._leave_edge(info):
+            lines.append(
+                "The pointer was then moved in from the edge of the window, where it would have "
+                "kept scrolling the camera."
+            )
         self.clock.sleep(self.config.settle_seconds)
         info = self._window()
         if not probe:
@@ -654,6 +708,7 @@ class Controller:
         prefix = f"{'+'.join(mods)}+" if mods else ""
         action = f"{prefix}{button} {kind}click".capitalize()
         lines = [f"{action} at ({x:g}, {y:g}){held}. The magenta ring marks where it landed."]
+        lines += self._steal_warning(mods)
         arguments = {"x": x, "y": y, "button": button, "modifiers": modifiers, "count": count,
                      "hold_seconds": hold_seconds}
         return self._after_input("click", arguments, lines, mark=True)
@@ -680,6 +735,7 @@ class Controller:
 
         self._input(run)
         lines = [f"Dragged the {button} button from ({x0:g}, {y0:g}) to ({x1:g}, {y1:g})."]
+        lines += self._steal_warning(mods)
         arguments = {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "button": button, "modifiers": modifiers}
         return self._after_input("drag", arguments, lines, mark=True)
 
@@ -702,6 +758,17 @@ class Controller:
         return self._after_input(
             "scroll", {"x": x, "y": y, "direction": direction, "amount": amount}, lines, mark=True, probe=False
         )
+
+    def _steal_warning(self, mods: list[str]) -> list[str]:
+        """Kenshi's highlight key is also what turns a click into stealing or lock-picking."""
+        _, key = parse_combo(self.config.keymap.get("highlight_items", "alt"))
+        if key not in mods:
+            return []
+        return [
+            f"{key.capitalize()} was held for this. In Kenshi that key is the steal and lock-pick "
+            "modifier as well as the highlight key: on an item, container or lock that belongs to "
+            "someone else, this was theft or lock-picking, a crime if anyone saw it."
+        ]
 
     # ---- keyboard ---------------------------------------------------------------
 
@@ -734,6 +801,8 @@ class Controller:
         if not 0 <= hold_seconds <= self.config.max_hold_seconds:
             raise ControlError(f"hold_seconds must be between 0 and {self.config.max_hold_seconds:g}.")
         mods, name = self._checked_combo(key)
+        if name == "escape":
+            raise ControlError(_ESCAPE_REFUSED)
         combo = "+".join([*mods, name])
         self._begin()
 
@@ -809,7 +878,7 @@ class Controller:
             )
         return self._after_input("type_text", {"text": text}, lines)
 
-    def hotkey(self, action: str, repeat: int = 1) -> Result:
+    def hotkey(self, action: str, repeat: int = 1, in_game: bool = False) -> Result:
         keymap = self.config.keymap
         usable = sorted(a for a in keymap if a not in _TIME_ACTIONS and not a.startswith("camera_"))
         if action in _TIME_ACTIONS:
@@ -822,20 +891,38 @@ class Controller:
             raise ControlError("repeat must be between 1 and 5.")
         combo = keymap[action]
         mods, name = self._checked_combo(combo)
+        if name == "escape":
+            # With no window open, Escape on Kenshi's title screen quits the game at once.
+            # Nothing here can tell the title screen from a game, so Claude has to say.
+            if not in_game:
+                raise ControlError(_ESCAPE_REFUSED)
+            if repeat != 1:
+                raise ControlError(
+                    "Escape is pressed once per call: a second press opens the game menu, or quits "
+                    "Kenshi if this is the title screen after all. Look at the screenshot in between."
+                )
         self._begin()
         arguments = {"action": action, "repeat": repeat}
 
         if action == "highlight_items":
             # The labels only show while the key is down, so the screenshot is taken mid-hold.
+            # The same key is Kenshi's steal and lock-pick modifier: it is down for this one
+            # screenshot and nothing is clicked meanwhile.
             def hold_and_look() -> Result:
                 for key in [*mods, name]:
                     self._key_down(key)
                 self._hold(max(0.5, self.config.settle_seconds))
-                info = self._window()
+                self._require_focus("holding the highlight key")
+                info = self.backend.locate()
                 shot = self._shot(info)
                 for key in reversed([*mods, name]):
                     self._key_up(key)
-                lines = [f"Held {combo} (highlight items) while taking this screenshot, then released it."]
+                lines = [
+                    f"Held {combo} (highlight items) for this screenshot only, then released it; nothing "
+                    "was clicked while it was down. That key is also Kenshi's steal and lock-pick "
+                    "modifier: a click with it held takes an item that belongs to someone else or "
+                    "starts picking a lock."
+                ]
                 return self._finish("hotkey", arguments, lines, info, [shot])
 
             return self._input(hold_and_look)
@@ -873,7 +960,8 @@ class Controller:
                     self._wheel(1 if action == "zoom_in" else -1)
                     self.clock.sleep(0.03)
             elif action in ("tilt_up", "tilt_down"):
-                travel = min(steps * _TILT_STEP_PIXELS, info.height // 2 - 2 * _EDGE_MARGIN - 1)
+                # Stop short of the window's edge, where the pointer would also scroll the view.
+                travel = min(steps * _TILT_STEP_PIXELS, info.height // 2 - self._scroll_margin(info)[1] - 1)
                 offset = -travel if action == "tilt_up" else travel
                 self._glide(info, *centre)
                 self._button_down("middle")

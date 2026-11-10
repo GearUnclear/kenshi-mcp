@@ -5,8 +5,9 @@ kinds of input the controller sends a real game: pause toggling, speed keys,
 click-to-select, right-click-to-move, camera keys and the wheel.
 
 Where Kenshi's handling of an input is what makes it awkward to automate, the stand-in
-copies it: speed keys that set a speed outright while the pause key toggles, and pauses
-the game makes by itself (a conversation, the build window).
+copies it: speed keys that set a speed outright while the pause key toggles, pauses the
+game makes by itself (a conversation, the build window), a camera that scrolls while the
+pointer rests on the window's edge, and a title screen that Escape quits.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ _SPEED_KEYS = {"f2": 1.0, "f3": 2.0, "f4": 4.0}
 _PAN_KEYS = {"w": (0, -1), "s": (0, 1), "a": (-1, 0), "d": (1, 0)}
 _UNIT_SPEED = 40.0  # world units per game second
 _PAN_SPEED = 300.0  # world units per held second
+_EDGE_SPEED = 300.0  # world units per second while the pointer rests on the window's edge
+_EDGE_ZONE = 0.01  # the outer share of the window, each side, that scrolls the camera
 _MENU_HOLD = 0.4
 _SELECT_RADIUS = 26
 
@@ -61,6 +64,8 @@ class MockBackend(Backend):
         self._before_conversation: bool | None = None
         self.build_mode = False  # the build window is open: Space places, it does not pause
         self.placed = 0  # buildings placed with Space in build mode
+        self.title_screen = False  # no game is loaded: Escape quits
+        self.quit = False
         self.speed_keys_resume = True  # False stands in for a state in which the speed keys are ignored
         self.typed = ""
         self.log: list[str] = []
@@ -98,6 +103,7 @@ class MockBackend(Backend):
             self.heading -= 90 * elapsed
         if "e" in self._held_keys:
             self.heading += 90 * elapsed
+        self._edge_scroll(elapsed)
         if self.paused:
             return
         game_elapsed = elapsed * self.speed
@@ -113,6 +119,18 @@ class MockBackend(Backend):
             else:
                 unit.x += dx / distance * step
                 unit.y += dy / distance * step
+
+    def _edge_scroll(self, elapsed: float) -> None:
+        """The camera pans while the pointer rests in the outer 1% of the window, paused or not."""
+        position = self._pointer_in_window()
+        if position is None or not self.focused:
+            return
+        for axis, size in ((0, self.width), (1, self.height)):
+            share = position[axis] / size
+            if share < _EDGE_ZONE:
+                self.camera[axis] -= _EDGE_SPEED * elapsed
+            elif share > 1 - _EDGE_ZONE:
+                self.camera[axis] += _EDGE_SPEED * elapsed
 
     # ---- what the game does to its own clock ------------------------------------
 
@@ -282,6 +300,8 @@ class MockBackend(Backend):
             for unit in self.units:
                 unit.selected = True
         elif key == "escape":
+            if self.title_screen:
+                self.quit, self.present = True, False  # no question asked
             self.menu = None
             self.build_mode = False
         if len(key) == 1 and key.isalnum():
@@ -361,8 +381,8 @@ class MockBackend(Backend):
             draw.text((mx + 10, my + 36), "Option 2", fill=(240, 240, 240), font=small)
 
         for i, label in enumerate(
-            text for text, shown in (("BUILD MODE", self.build_mode), ("CONVERSATION", self.conversation))
-            if shown
+            text for text, shown in (("BUILD MODE", self.build_mode), ("CONVERSATION", self.conversation),
+                                     ("TITLE SCREEN", self.title_screen)) if shown
         ):
             draw.text((self.width - 170, 34 + i * 22), label, fill=(240, 190, 60), font=small)
 

@@ -20,6 +20,10 @@ def keys_pressed(backend) -> list[str]:
     return [event[1] for event in backend.events if event[0] == "key" and event[2]]
 
 
+def moves_of(backend) -> list[tuple[int, int]]:
+    return [(event[1], event[2]) for event in backend.events if event[0] == "move"]
+
+
 def image_of(result) -> Image.Image:
     return Image.open(io.BytesIO(result.images[-1].data))
 
@@ -587,7 +591,7 @@ def test_a_click_in_the_corner_of_a_window_at_the_screen_corner_does_not_trip_th
     backend.left = backend.top = 0  # borderless, at the origin of the desktop
     backend._pointer = (800, 450)
     controller.click(0, 0)
-    assert backend.cursor() == (5, 5)
+    assert [e[3:] for e in backend.events if e[0] == "button"] == [(5, 5), (5, 5)]
     controller.click(1, 2)  # the next action is not halted
     assert not controller.config.stop_file.exists()
 
@@ -596,14 +600,14 @@ def test_the_pointer_is_never_parked_in_or_dragged_through_the_corner(controller
     backend.left = backend.top = -10  # the window hangs off the top-left of the screen
     backend._pointer = (-3, 5)
     controller.click(12, 6)  # window (15, 7) is screen (5, -3): the straight path crosses (1, 1)
-    moves = [(e[1], e[2]) for e in backend.events if e[0] == "move"]
+    moves = moves_of(backend)
     assert moves and not [m for m in moves if 0 <= m[0] <= 3 and 0 <= m[1] <= 3]
     backend._pointer = (800, 450)
     controller.click(8, 8)  # window (10, 10) is the corner pixel itself
-    assert backend.cursor() == (4, 0)
-    downs = [e for e in backend.events if e[0] == "button" and e[2]]
-    assert downs[-1][3:] == (4, 0), "it clicked where it stopped, and the ring is drawn there"
+    presses = [e for e in backend.events if e[0] == "button"]
+    assert [e[3:] for e in presses[-2:]] == [(4, 0), (4, 0)], "it clicked where it stopped, and the ring is drawn there"
     assert controller._pointer == (14, 10)
+    assert not [m for m in moves_of(backend) if 0 <= m[0] <= 3 and 0 <= m[1] <= 3], "nor on the way back in"
 
 
 def test_the_failsafe_corner_follows_the_backend(controller, config, backend):
@@ -620,7 +624,7 @@ def test_without_the_failsafe_corner_the_pointer_may_go_anywhere(config, backend
     backend.left = backend.top = -10
     controller = Controller(config, backend, clock)
     controller.click(8, 8)
-    assert backend.cursor() == (0, 0)
+    assert [e[3:] for e in backend.events if e[0] == "button"] == [(0, 0), (0, 0)]
     controller.observe()
 
 
@@ -1003,3 +1007,124 @@ def test_set_speed_pause_presses_nothing_on_a_game_it_believes_paused_and_says_h
     assert "sync_pause(paused=false)" in result.text
     assert "Call set_speed('pause')" in controller.sync_pause(False).text
 
+
+# ---- Escape, which quits Kenshi from its title screen ----------------------------------
+
+
+def test_escape_is_only_sent_on_claudes_word_that_a_game_is_loaded(controller, backend):
+    backend.title_screen = True
+    for refused in (lambda: controller.hotkey("close"), lambda: controller.press_key("escape"),
+                    lambda: controller.press_key("esc", repeat=3), lambda: controller.press_key("shift+escape")):
+        with pytest.raises(ControlError, match="title screen.*quits.*in_game=true"):
+            refused()
+    assert keys_pressed(backend) == [] and not backend.quit and backend.present
+    backend.title_screen = False
+    result = controller.hotkey("close", in_game=True)
+    assert keys_pressed(backend) == ["escape"] and "Pressed escape (close)" in result.text
+
+
+def test_escape_is_pressed_once_per_call(controller, backend):
+    with pytest.raises(ControlError, match="once per call"):
+        controller.hotkey("close", repeat=2, in_game=True)
+    assert keys_pressed(backend) == []
+
+
+def test_what_the_refusal_is_for(controller, backend):
+    backend.title_screen = True
+    with pytest.raises(ControlError):  # Claude was wrong about being in a game: the window is gone
+        controller.hotkey("close", in_game=True)
+    assert backend.quit and not backend.present
+
+
+def test_a_close_action_bound_to_another_key_needs_no_such_word(config, backend, clock):
+    config.keymap["close"] = "backspace"
+    Controller(config, backend, clock).hotkey("close")
+    assert keys_pressed(backend) == ["backspace"]
+
+
+# ---- the edge of the window, where a resting pointer scrolls the camera -----------------
+
+
+def test_a_click_on_the_edge_lands_there_and_the_pointer_is_then_moved_in(controller, backend, clock):
+    result = controller.click(640, 719)  # a HUD button on the bottom edge
+    assert [e[2:] for e in backend.events if e[0] == "button"] == [(True, 920, 954), (False, 920, 954)]
+    assert backend.cursor() == (920, 60 + 885), "1.5% of the window's height in from the edge"
+    assert controller._pointer == (800, 894), "the ring still marks where the click landed"
+    assert "moved in from the edge" in result.text
+    camera = list(backend.camera)
+    clock.sleep(10)
+    assert "picture changing 0.00%" in controller.observe().text and backend.camera == camera
+
+
+@pytest.mark.parametrize(
+    ("point", "parked"),
+    [((0, 360), (24, 450)), ((1279, 360), (1575, 450)), ((640, 0), (800, 14)), ((1279, 719), (1575, 885))],
+    ids=["left", "right", "top", "bottom-right"],
+)
+def test_every_edge_is_left_the_same_way(controller, backend, point, parked):
+    controller.click(*point)
+    assert backend.cursor() == (120 + parked[0], 60 + parked[1])
+    assert "moved in from the edge" not in controller.click(*UNIT_2).text
+
+
+def test_a_pointer_found_resting_on_the_edge_is_moved_in_before_looking(controller, backend):
+    backend._pointer = (120 + 1599, 60 + 450)  # where the operator's hand left it
+    result = controller.observe()
+    assert backend.cursor() == (120 + 1575, 60 + 450)
+    assert "inferred as PAUSED" in result.text, "a scrolling view would have looked like a running game"
+    backend._pointer = (5000, 5000)  # outside the game altogether: not ours to move
+    controller.observe()
+    assert backend.cursor() == (5000, 5000)
+
+
+def test_a_drag_or_a_scroll_that_ends_on_the_edge_is_moved_in_too(controller, backend):
+    controller.drag(400, 200, 1279, 300)
+    assert backend.cursor()[0] == 120 + 1575
+    controller.scroll(640, 719, "down", 1)
+    assert backend.cursor()[1] == 60 + 885
+
+
+def test_tilting_the_camera_stops_short_of_the_edge(controller, backend):
+    controller.camera("tilt_down", 20)
+    released = [e for e in backend.events if e[0] == "button" and e[1] == "middle" and not e[2]][0]
+    assert released[4] == 60 + 450 + (450 - 14 - 1)
+    assert "moved in" not in controller.observe().text
+
+
+def test_the_corner_is_the_operators_even_though_it_is_on_the_edge(controller, config, backend):
+    backend.left = backend.top = 0
+    backend._pointer = (1, 1)
+    with pytest.raises(Halted, match="top-left corner"):
+        controller.observe()
+    assert backend.cursor() == (1, 1), "it was not moved away, which would have hidden the stop"
+
+
+# ---- the highlight key, which is also the key for stealing ------------------------------
+
+
+def test_nothing_is_clicked_while_the_highlight_key_is_down(controller, backend):
+    result = controller.hotkey("highlight_items")
+    held = [(e[0], e[1]) for e in backend.events
+            if when(backend, "key", "alt", True) <= backend.stamps[backend.events.index(e)]
+            <= when(backend, "key", "alt", False)]
+    assert held == [("key", "alt"), ("key", "alt")], "down, the screenshot, up: no click, no move"
+    assert "steal and lock-pick" in result.text and backend._held_keys == {}
+
+
+def test_a_click_with_the_highlight_key_held_says_what_that_means_in_kenshi(controller, config, backend):
+    assert "steal and lock-pick modifier" in controller.click(*UNIT_2, button="right", modifiers="alt").text
+    assert "steal and lock-pick modifier" in controller.drag(400, 200, 500, 300, modifiers="ctrl+alt").text
+    for harmless in ("", "shift", "ctrl"):
+        assert "steal" not in controller.click(*UNIT_2, modifiers=harmless).text
+    config.keymap["highlight_items"] = "ctrl"  # the operator moved it
+    assert "Ctrl was held" in controller.click(*UNIT_2, modifiers="ctrl").text
+    assert "steal" not in controller.click(*UNIT_2, modifiers="alt").text
+
+
+def test_the_highlight_key_is_released_if_the_game_loses_focus_under_it(config, backend, clock, monkeypatch):
+    config.auto_focus = False
+    controller = Controller(config, backend, clock)
+    after(clock, monkeypatch, 0.2, lambda: setattr(backend, "focused", False))
+    with pytest.raises(ControlError, match="lost focus while holding the highlight key"):
+        controller.hotkey("highlight_items")
+    assert ("key", "alt", False) in backend.events

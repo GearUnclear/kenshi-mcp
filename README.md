@@ -143,6 +143,9 @@ Other guard rails:
 - A click is refused where another window, such as a notification, covers the game.
 - Key combinations that leave the game (the Windows key, Alt+Tab, Alt+F4, Shift+Tab for the
   Steam overlay and similar) are refused, as are Kenshi's debug shortcuts.
+- Escape is only sent when Claude states that a game is loaded: on the title screen it quits
+  Kenshi without asking.
+- The pointer is not left resting on the edge of the window, where it scrolls the camera.
 - If Kenshi is running as administrator and this is not, it says so instead of failing silently.
 
 ## Tools

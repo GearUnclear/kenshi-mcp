@@ -209,6 +209,14 @@ def test_a_click_where_another_window_covers_the_game_is_not_sent(game, window_l
         stop_window(overlay)
 
 
+def test_a_click_on_the_edge_of_the_window_does_not_leave_the_pointer_there(game, window_log):
+    game.click(400, 599)
+    seen = wait_for(window_log, lambda seen: any(e["type"] == "button" and not e["down"] for e in seen))
+    assert [(e["x"], e["y"]) for e in seen if e["type"] == "button"] == [(400, 594), (400, 594)]
+    time.sleep(0.2)
+    assert game.backend.cursor() == (LEFT + 400, TOP + 590), "1.5% of the height in from the edge"
+
+
 def test_time_is_set_with_keys_that_cannot_be_inverted(game, window_log):
     game.advance(0.5, "fast", frames=0)
     seen = wait_for(window_log, lambda seen: sum(e["type"] == "key" and not e["down"] for e in seen) >= 3)

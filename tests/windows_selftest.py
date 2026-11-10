@@ -150,6 +150,17 @@ def main() -> int:
         check("drag ends at (500, 400)", (left[-1]["x"], left[-1]["y"], left[-1]["down"]) == (500, 400, False), left[-1])
         check("motion seen with the button down", any(e["type"] == "motion" and e["left_down"] for e in seen))
 
+        before = len(events(log))
+        game.click(400, 599)
+        seen = wait_for(log, lambda ev: any(e["type"] == "button" and not e["down"] for e in ev[before:]),
+                        "a click on the edge")[before:]
+        edge = [(e["x"], e["y"]) for e in seen if e["type"] == "button"]
+        check("a click on the window's edge lands there", edge == [(400, 594), (400, 594)], edge)
+        time.sleep(0.2)
+        info = game.backend.locate()
+        check("... and the pointer is then moved in from the edge",
+              game.backend.cursor() == (info.left + 400, info.top + 590), game.backend.cursor())
+
         # Windows does not document how it rounds pointer coordinates. The controller checks
         # every move and puts the pointer right if need be; this says whether it had to.
         info = game.backend.locate()
@@ -227,6 +238,12 @@ def main() -> int:
         keys = [e["vk"] for e in seen if e["type"] == "key" and e["down"]]
         check("advance = fast speed, then normal speed and pause", keys == [VK_F3, VK_F2, VK_SPACE],
               [hex(v) for v in keys])
+        try:
+            game.hotkey("close")
+            check("Escape refused without word that a game is loaded", False)
+        except ControlError as exc:
+            check("Escape refused without word that a game is loaded", "title screen" in str(exc), exc)
+
         print("safety")
         for combo in ("alt+f4", "ctrl+alt+f4", "alt+shift"):
             try:

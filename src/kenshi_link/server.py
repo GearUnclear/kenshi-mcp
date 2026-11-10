@@ -127,7 +127,7 @@ def build_server(
             bool, Field(description="Draw a labelled coordinate grid over the screenshot.")
         ] = False,
     ) -> list:
-        """Take a screenshot of the Kenshi window without touching the game.
+        """Take a screenshot of the Kenshi window. Nothing is clicked or pressed.
 
         Call this at the start, after waiting for something, and any time you are unsure
         what is on screen. It also re-checks whether the game looks paused. Other tools
@@ -158,7 +158,12 @@ def build_server(
         y: Annotated[float, Field(description="Y in screenshot pixels.")],
         button: Annotated[Button, Field(description="Mouse button.")] = "left",
         modifiers: Annotated[
-            str, Field(description="Key held during the click: '', 'shift', 'ctrl' or 'alt'.")
+            str,
+            Field(
+                description="Key held during the click: '', 'shift', 'ctrl' or 'alt'. Alt is Kenshi's "
+                "steal and lock-pick key: with it, a click takes an item that belongs to someone else "
+                "or starts picking a lock."
+            ),
         ] = "",
         count: Annotated[int, Field(description="1 for a click, 2 for a double-click.", ge=1, le=3)] = 1,
         hold_seconds: Annotated[
@@ -211,7 +216,7 @@ def build_server(
     async def press_key(
         key: Annotated[
             str,
-            Field(description="A key or combo such as 'escape', 'enter', 'r', 'f7', 'shift+a', 'delete'."),
+            Field(description="A key or combo such as 'enter', 'r', 'f7', 'shift+a', 'delete'."),
         ],
         repeat: Annotated[int, Field(description="How many times to press it.", ge=1, le=20)] = 1,
         hold_seconds: Annotated[float, Field(description="Hold each press this long.", ge=0)] = 0.0,
@@ -220,7 +225,8 @@ def build_server(
 
         Prefer the dedicated tools: set_speed and advance for time, camera for the camera,
         hotkey for game windows, squad selection and saving. Keys that would leave the game
-        (the Windows key, alt+tab, alt+f4 and similar) are refused.
+        (the Windows key, alt+tab, alt+f4 and similar) are refused, and so is Escape, which
+        quits Kenshi from its title screen: send it with hotkey('close', in_game=true).
         """
         return await session.run("press_key", key, repeat, hold_seconds)
 
@@ -247,20 +253,30 @@ def build_server(
         description=(
             "Press one of Kenshi's hotkeys by what it does, using the operator's key bindings.\n\n"
             "Actions: " + ", ".join(hotkey_actions) + ".\n"
-            "inventory, map, stats, research and crafting open or close that window. build_mode opens "
-            "or closes the build window: Kenshi pauses itself while it is open, so close it before "
-            "set_speed or advance. "
-            "select_1 to select_10 pick a squad member (repeat=2 also centres the camera on them); "
-            "select_all picks the whole squad; next_squad switches squad. close presses Escape. "
-            "highlight_items shows item labels in the returned screenshot. quick_save saves; "
-            "quick_load loads the last quick save and discards everything since."
+            "inventory and stats open or close the selected character's window. map, research and "
+            "crafting open one large tabbed window on that tab; close shuts it. build_mode opens or "
+            "closes the build window: Kenshi pauses itself while it is open, so close it before "
+            "set_speed or advance. select_1 to select_10 pick a squad member (repeat=2 also centres "
+            "the camera on them); select_all picks the whole squad; next_squad switches squad. "
+            "close presses Escape, which closes every open window, or with none open brings up the "
+            "game menu. On the title screen Escape quits Kenshi without asking, so close is refused "
+            "unless in_game=true. highlight_items holds the highlight key for one screenshot so that "
+            "item labels show. quick_save saves; quick_load loads the last quick save and discards "
+            "everything since."
         )
     )
     async def hotkey(
         action: Annotated[str, Field(description="One of the listed action names.")],
         repeat: Annotated[int, Field(description="How many times to press it.", ge=1, le=5)] = 1,
+        in_game: Annotated[
+            bool,
+            Field(
+                description="Needed for close only. True says the latest screenshot shows a loaded game "
+                "(the world, or a window over it) and not the title screen."
+            ),
+        ] = False,
     ) -> list:
-        return await session.run("hotkey", action, repeat)
+        return await session.run("hotkey", action, repeat, in_game)
 
     # ---- camera -----------------------------------------------------------------
 

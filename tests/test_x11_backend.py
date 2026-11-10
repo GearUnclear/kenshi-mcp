@@ -140,6 +140,16 @@ def test_scroll_and_drag(game, window_log):
     assert dragged, "pointer motion was seen while the left button was down"
 
 
+def test_a_click_on_the_edge_of_the_window_does_not_leave_the_pointer_there(game, window_log):
+    game.click(400, 599)
+    events = _wait_for(window_log, lambda ev: sum(e["type"] == "button" and not e["down"] for e in ev) >= 1)
+    clicked = [e for e in events if e["type"] == "button"]
+    assert (clicked[0]["x"], clicked[0]["y"]) == (400, 594), "as near the edge as a click goes"
+    time.sleep(0.2)
+    resting = [e for e in _events(window_log) if e["type"] == "motion"][-1]
+    assert (resting["x"], resting["y"]) == (400, 590), "then 1.5% of the height in from it"
+
+
 def test_no_window_is_reported_clearly(tmp_path):
     config = Config(backend="x11", data_dir=tmp_path / "home", x11_class_regex="no-such-game")
     controller = Controller(config)
