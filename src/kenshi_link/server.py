@@ -247,7 +247,9 @@ def build_server(
         description=(
             "Press one of Kenshi's hotkeys by what it does, using the operator's key bindings.\n\n"
             "Actions: " + ", ".join(hotkey_actions) + ".\n"
-            "inventory, map, stats, research, crafting and build_mode open or close that window. "
+            "inventory, map, stats, research and crafting open or close that window. build_mode opens "
+            "or closes the build window: Kenshi pauses itself while it is open, so close it before "
+            "set_speed or advance. "
             "select_1 to select_10 pick a squad member (repeat=2 also centres the camera on them); "
             "select_all picks the whole squad; next_squad switches squad. close presses Escape. "
             "highlight_items shows item labels in the returned screenshot. quick_save saves; "
@@ -292,10 +294,12 @@ def build_server(
         """Let game time pass, then pause again and show the result.
 
         This is the normal way to make anything happen: give orders while paused, then
-        advance. It unpauses at the chosen speed, waits, re-pauses, and returns a strip of
+        advance. It sets the chosen speed, waits, pauses again, and returns a strip of
         frames from along the way plus a screenshot of the paused game. Keep it short
         (2-10 s, normal speed) when enemies or other risks are near; use longer runs at
-        fast or fastest for travel, mining, healing and waiting.
+        fast or fastest for travel, mining, healing and waiting. The result says so if the
+        picture stopped changing part-way, which is what a game that paused itself (a
+        conversation opened, an area was loading) looks like.
         """
         return await session.run("advance", seconds, speed, frames)
 
@@ -305,9 +309,12 @@ def build_server(
     ) -> list:
         """Pause the game, or set it running and leave it running.
 
-        Use set_speed('pause') to make sure the game is paused. Setting a running speed
-        leaves the clock running while you think, which is rarely what you want: use
-        advance instead unless you intend to watch something unfold with repeated observe calls.
+        set_speed('pause') presses the key for normal speed and then the pause key, which
+        ends paused whatever the game was doing before. If this tool believes the game is
+        already paused it presses nothing, so correct it with sync_pause first if the
+        screenshot shows otherwise. Setting a running speed leaves the clock running while
+        you think, which is rarely what you want: use advance instead unless you intend to
+        watch something unfold with repeated observe calls.
         """
         return await session.run("set_speed", speed)
 
@@ -317,9 +324,11 @@ def build_server(
     ) -> list:
         """Correct this tool's record of whether the game is paused. Presses nothing.
 
-        Call it when the screenshot contradicts the status line (for example the game's
-        pause indicator is showing but the status says RUNNING), so that the next
-        set_speed or advance presses the pause key the right number of times.
+        Call it when the screenshot contradicts the status line: Kenshi's PAUSED panel is
+        showing but the status says RUNNING or unknown, or the panel is missing but the
+        status says PAUSED. Kenshi pauses and un-pauses itself (conversations, the build
+        window, character creation, loading), and this tool cannot see that. After
+        sync_pause(paused=false), set_speed('pause') pauses the game.
         """
         return await session.run("sync_pause", paused)
 

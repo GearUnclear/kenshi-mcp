@@ -29,7 +29,7 @@ from kenshi_link.controller import ControlError, Controller  # noqa: E402
 
 # Set-1 scancodes: the physical keys, whatever the keyboard layout prints on them.
 SCAN = {"f2": 0x3C, "i": 0x17, "up": 0x48, "w": 0x11}
-VK_SPACE, VK_F3, VK_UP, VK_SHIFT = 0x20, 0x72, 0x26, 0x10
+VK_SPACE, VK_F2, VK_F3, VK_UP, VK_SHIFT = 0x20, 0x71, 0x72, 0x26, 0x10
 FIXTURE = HERE / "fixtures" / "win_window.py"
 
 
@@ -225,8 +225,8 @@ def main() -> int:
         seen = wait_for(log, lambda ev: sum(e["type"] == "key" and not e["down"] for e in ev[before:]) >= 3,
                         "advance keys")[before:]
         keys = [e["vk"] for e in seen if e["type"] == "key" and e["down"]]
-        check("advance = unpause, fast speed, pause", keys == [VK_SPACE, VK_F3, VK_SPACE], [hex(v) for v in keys])
-
+        check("advance = fast speed, then normal speed and pause", keys == [VK_F3, VK_F2, VK_SPACE],
+              [hex(v) for v in keys])
         print("safety")
         for combo in ("alt+f4", "ctrl+alt+f4", "alt+shift"):
             try:

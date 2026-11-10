@@ -9,6 +9,13 @@ Three ideas shape it:
   maps that to the window and the screen.
 * Input is only ever sent while the Kenshi window has focus, is limited to keys
   that stay inside the game, and stops for good when the operator says so.
+
+Nothing can be read from the game, so the pause state kept here is a belief. Kenshi
+pauses and un-pauses itself (a conversation, the build window, character creation, an
+area loading), which no key press of ours explains. Two rules keep a wrong belief from
+doing harm: the keys pressed never depend on it in a way that could invert (a speed key
+sets a speed outright, and the pause key, which toggles, is only pressed straight after
+one), and whenever the picture contradicts the belief the result says so.
 """
 
 from __future__ import annotations
@@ -463,24 +470,27 @@ class Controller:
         self.pause_source = "inferred"
         state = "PAUSED" if self.paused else "RUNNING"
         return (
-            f"The pause state was unknown, so it was inferred as {state} from whether the picture "
-            "is changing. Check the screenshot for the game's own pause indicator and call "
-            "sync_pause if this is wrong."
+            f"The pause state was not known, so it was inferred as {state} from whether the picture "
+            "is changing. Kenshi shows a PAUSED panel while it is paused: if the screenshot says "
+            "otherwise, call sync_pause."
         )
 
     def _reconcile(self, motion: float) -> list[str]:
+        """What to tell Claude when the picture and the pause belief disagree."""
         if self.paused is None:
             return [self._infer_pause(motion)]
         if self.paused and self._moving(motion):
             return [
-                f"Note: {motion:.2%} of the picture is still changing although the game should be "
-                "paused. Animated UI or weather can cause this, but if the game's pause indicator "
-                "is missing, call sync_pause(paused=false) and then set_speed('pause')."
+                f"Note: {motion:.2%} of the picture is changing although the game should be paused. A "
+                "moving camera or animated UI can do that. So can the game: Kenshi un-pauses itself "
+                "when a conversation closes and when character creation is confirmed. If the PAUSED "
+                "panel is not showing, call sync_pause(paused=false) and then set_speed('pause')."
             ]
         if not self.paused and not self._moving(motion):
             return [
-                "Note: the picture is not changing although the game should be running. If the "
-                "game's pause indicator is showing, call sync_pause(paused=true)."
+                "Note: the picture is not changing although the game should be running. Kenshi "
+                "pauses itself for a conversation, the build window, character creation and while an "
+                "area loads. If the PAUSED panel is showing, call sync_pause(paused=true)."
             ]
         return []
 
@@ -488,26 +498,54 @@ class Controller:
         fit = self._fit(info)
         if self.paused is None:
             state = "pause state unknown"
+        elif self.paused:
+            state = f"game PAUSED ({self.pause_source})"
         else:
-            state = f"game {'PAUSED' if self.paused else 'RUNNING'} ({self.pause_source})"
-        parts = [state, f"speed {self.speed or 'unknown'}", f"screenshot {fit.width}x{fit.height}"]
+            state = f"game RUNNING at {self.speed or 'unknown'} speed ({self.pause_source})"
+        parts = [state, f"screenshot {fit.width}x{fit.height}"]
         if motion is not None:
             parts.append(f"picture changing {motion:.2%}")
         return "[" + " · ".join(parts) + "]"
 
-    def _resume(self, info: WindowInfo, speed: str) -> list[str]:
-        notes: list[str] = []
-        if self.paused is None:
-            _, motion = self._probe(info)
-            notes.append(self._infer_pause(motion))
-        if self.paused:
-            self._tap(self.config.keymap["pause"], checked=False)
-            self.clock.sleep(0.08)
+    def _resume(self, speed: str) -> None:
+        """Set the clock running at `speed`.
+
+        Only the speed key is pressed. It sets that speed outright and ends a pause, so the
+        result is the same whatever state the game was in. The pause key is not used here:
+        it toggles, and would pause a game that was running after all.
+        """
         self._tap(self.config.keymap[f"speed_{speed}"], checked=False)
         self.paused = False
         self.pause_source = "tracked"
         self.speed = speed
-        return notes
+
+    def _pause(self) -> None:
+        """Pause the game, whatever state it is in.
+
+        The pause key toggles, and the game also pauses by itself, so pressing it on the
+        strength of a belief can start the clock instead of stopping it. Normal speed is
+        asked for first: that leaves the game running whatever it was doing before, and the
+        toggle then has only one way to go. If the game had paused itself, it runs for the
+        moment between the two keys. Normal speed rather than the one last asked for, because
+        the pause key remembers the speed it interrupted, and that is the speed the game goes
+        back to if it later un-pauses by itself.
+        """
+        self._tap(self.config.keymap["speed_normal"], checked=False)
+        self._tap(self.config.keymap["pause"], checked=False)
+        self.paused = True
+        self.pause_source = "tracked"
+        self.speed = "normal"
+
+    def _confirm_pause(self, motion: float) -> list[str]:
+        """After the pause keys: does the picture agree that the game has stopped?"""
+        if not self._moving(motion):
+            return []
+        self._forget_pause()
+        return [
+            f"THE GAME MAY STILL BE RUNNING: {motion:.2%} of the picture is changing after the pause "
+            "keys were pressed, so the pause state is now unknown. Look for the PAUSED panel. If it "
+            "is showing, call sync_pause(paused=true); if it is not, call set_speed('pause') again."
+        ]
 
     def _finish(
         self, action: str, arguments: dict, lines: list[str], info: WindowInfo, images: list[Shot],
@@ -517,10 +555,23 @@ class Controller:
         self._log(action, arguments, text)
         return Result(text, images)
 
-    def _after_input(self, action: str, arguments: dict, lines: list[str], *, mark: bool = False) -> Result:
+    def _after_input(
+        self, action: str, arguments: dict, lines: list[str], *, mark: bool = False, probe: bool = True
+    ) -> Result:
+        """The screenshot and status that end an input action.
+
+        `probe` also measures whether the picture is changing and says so when that
+        contradicts the pause belief: it is how a game that un-paused itself (a conversation
+        closed, character creation was confirmed) is noticed before the next advance. It is
+        left out where the action itself moves the view.
+        """
         self.clock.sleep(self.config.settle_seconds)
         info = self._window()
-        return self._finish(action, arguments, lines, info, [self._shot(info, mark=mark)])
+        if not probe:
+            return self._finish(action, arguments, lines, info, [self._shot(info, mark=mark)])
+        frame, motion = self._probe(info)
+        lines += self._reconcile(motion)
+        return self._finish(action, arguments, lines, info, [self._shot(info, frame, mark=mark)], motion)
 
     # ---- looking ----------------------------------------------------------------
 
@@ -649,7 +700,7 @@ class Controller:
         self._input(run)
         lines = [f"Scrolled {direction} {amount} notch(es) at ({x:g}, {y:g})."]
         return self._after_input(
-            "scroll", {"x": x, "y": y, "direction": direction, "amount": amount}, lines, mark=True
+            "scroll", {"x": x, "y": y, "direction": direction, "amount": amount}, lines, mark=True, probe=False
         )
 
     # ---- keyboard ---------------------------------------------------------------
@@ -698,13 +749,28 @@ class Controller:
             if self.paused is not None and repeat % 2 == 1:
                 self.paused = not self.paused
                 self.pause_source = "tracked"
-            lines.append("That is the pause key, so pause was toggled. Prefer set_speed for this.")
+            lines.append(
+                "That is the pause key. It toggles, so this tool's record was flipped; whether the "
+                "game followed depends on what state it was really in. Prefer set_speed for this."
+            )
         for speed in SPEEDS[1:]:
             if self._same_combo(mods, name, f"speed_{speed}"):
-                self.speed = speed
+                self.speed, self.paused, self.pause_source = speed, False, "tracked"
+                lines.append(f"That is the key for {speed} speed, which also ends a pause: the game is running.")
+        if self._same_combo(mods, name, "build_mode") and repeat % 2 == 1:
+            lines += self._build_mode_pressed()
         return self._after_input(
             "press_key", {"key": key, "repeat": repeat, "hold_seconds": hold_seconds}, lines
         )
+
+    def _build_mode_pressed(self) -> list[str]:
+        """The build window makes the pause belief worthless, in both directions."""
+        self._forget_pause()
+        return [
+            "Kenshi pauses itself when the build window opens. While it is open the pause key confirms "
+            "the build instead of pausing, and the speed keys close the window: so close it (this key "
+            "again) before set_speed or advance."
+        ]
 
     def type_text(self, text: str) -> Result:
         if not text:
@@ -782,10 +848,12 @@ class Controller:
         self._input(run)
         lines = [f"Pressed {combo} ({action})" + (f" x{repeat}" if repeat > 1 else "") + "."]
         if action == "quick_load":
-            self.paused = None
-            self.pause_source = "unknown"
+            self._forget_pause()
             self.clock.sleep(1.0)
             lines.append("A load was requested; wait for it to finish, then observe to re-check the pause state.")
+            return self._after_input("hotkey", arguments, lines, probe=False)
+        if action == "build_mode" and repeat % 2 == 1:
+            lines += self._build_mode_pressed()
         return self._after_input("hotkey", arguments, lines)
 
     # ---- camera -----------------------------------------------------------------
@@ -819,7 +887,7 @@ class Controller:
         self._input(run)
         self._pointer = None
         lines = [f"Camera {action.replace('_', ' ')}, {steps} step(s)."]
-        return self._after_input("camera", {"action": action, "steps": steps}, lines)
+        return self._after_input("camera", {"action": action, "steps": steps}, lines, probe=False)
 
     # ---- time -------------------------------------------------------------------
 
@@ -835,31 +903,35 @@ class Controller:
     def _set_speed(self, speed: str) -> Result:
         info = self._begin()
         lines: list[str] = []
+        pressed = False
 
         def run() -> None:
-            if speed == "pause":
-                if self.paused is None:
-                    _, motion = self._probe(info)
-                    lines.append(self._infer_pause(motion))
-                if self.paused:
-                    lines.append("The game is already paused; nothing was pressed.")
-                else:
-                    self._tap(self.config.keymap["pause"], checked=False)
-                    self.paused = True
-                    self.pause_source = "tracked"
-                    lines.append("Paused the game.")
-            else:
-                lines.extend(self._resume(info, speed))
+            nonlocal pressed
+            if speed != "pause":
+                self._resume(speed)
                 lines.append(
                     f"The game is now RUNNING at {speed} speed and will keep running while you think. "
                     "Pause again as soon as you need to decide something."
                 )
+                return
+            if self.paused is None:
+                _, motion = self._probe(info)
+                lines.append(self._infer_pause(motion))
+            if self.paused:
+                lines.append(
+                    "This tool's record says the game is already paused, so nothing was pressed. If "
+                    "the PAUSED panel is not showing, call sync_pause(paused=false) and then this again."
+                )
+            else:
+                self._pause()
+                pressed = True
+                lines.append("Paused the game.")
 
         self._input(run)
         self.clock.sleep(self.config.settle_seconds)
         info = self._window()
         frame, motion = self._probe(info)
-        lines += self._reconcile(motion)
+        lines += self._confirm_pause(motion) if pressed else self._reconcile(motion)
         return self._finish("set_speed", {"speed": speed}, lines, info, [self._shot(info, frame)], motion)
 
     def advance(self, seconds: float, speed: str = "normal", frames: int = 2) -> Result:
@@ -874,11 +946,9 @@ class Controller:
         arguments = {"seconds": seconds, "speed": speed, "frames": frames}
         lines: list[str] = []
         samples: list[Image.Image] = []
+        first = self._grab(info)  # what the screen showed before the clock was started
 
-        def start() -> None:
-            lines.extend(self._resume(info, speed))
-
-        self._input(start)
+        self._input(self._resume, speed)
         began = self.clock.now()
         sample_times = [began + seconds * (i + 1) / (frames + 1) for i in range(frames)]
         left_running = f"The game was not paused: it was left running at {speed} speed."
@@ -919,9 +989,15 @@ class Controller:
             self._forget_pause()
             raise Halted(f"{interrupted} {left_running}") from interrupted
 
+        last: Image.Image | None = None
         try:
             info = self._window()
-            self._input(self._tap, self.config.keymap["pause"], checked=False)
+            if not self._closing.is_set():
+                try:
+                    last = self.backend.capture(info.left, info.top, info.width, info.height)
+                except Exception:
+                    pass  # only used to tell whether anything happened
+            self._input(self._pause)
         except Halted as exc:  # the desktop went away (locked screen): the key cannot get there
             self.paused = False
             raise Halted(f"{exc} {left_running}") from exc
@@ -931,8 +1007,6 @@ class Controller:
                 f"THE GAME IS STILL RUNNING at {speed} speed: it could not be paused after "
                 f"{ran_for:.1f}s because: {exc}"
             ) from exc
-        self.paused = True
-        self.pause_source = "tracked"
         if self._closing.is_set():
             text = f"Shutting down: the run was stopped after {ran_for:.1f}s and the game was paused."
             self._log("advance", arguments, text)
@@ -944,6 +1018,8 @@ class Controller:
         lines.append(f"Ran the game for {ran_for:.1f}s of real time at {speed} speed, then paused it.")
         if cut_short:
             lines.append(f"That is less than the {seconds:g}s asked for, because {cut_short}.")
+        if last is not None:
+            lines += self._what_the_run_showed([first, *samples, last])
         images: list[Shot] = []
         strip = imaging.filmstrip(samples)
         if strip is not None:
@@ -953,13 +1029,36 @@ class Controller:
                 "image 2 is the screen now."
             )
         images.append(self._shot(info, frame))
-        lines += self._reconcile(motion)
+        lines += self._confirm_pause(motion)
         return self._finish("advance", arguments, lines, info, images, motion)
+
+    def _what_the_run_showed(self, frames: list[Image.Image]) -> list[str]:
+        """Whether the picture kept changing through a run, from the frames taken along it.
+
+        A game that pauses itself part-way (a conversation opens, an area loads) cannot be
+        told from the keys pressed, only from a picture that stops changing.
+        """
+        changed = [self._moving(imaging.motion_fraction(a, b)) for a, b in zip(frames, frames[1:])]
+        if not any(changed):
+            return [
+                "NOTHING ON SCREEN CHANGED during the run. Either nothing in view was moving, or the "
+                "clock never ran: a conversation, the game menu or a loading screen can hold Kenshi "
+                "paused whatever key is pressed. Check the screenshot before advancing again."
+            ]
+        if len(changed) > 1 and not changed[-1]:
+            return [
+                "The picture stopped changing before the end of the run. Either everything in view "
+                "came to rest, or Kenshi paused itself part-way, as it does when a conversation opens "
+                "or an area loads: look at the strip and the screenshot."
+            ]
+        return []
 
     def sync_pause(self, paused: bool) -> Result:
         self.paused = bool(paused)
         self.pause_source = "told"
         text = f"Recorded that the game is {'PAUSED' if paused else 'RUNNING'}. No key was pressed."
+        if not paused:
+            text += " Call set_speed('pause') to pause it."
         self._log("sync_pause", {"paused": paused}, text)
         return Result(text)
 

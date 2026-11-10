@@ -67,7 +67,7 @@ def test_observe_flags_a_pause_belief_that_the_picture_contradicts(controller, b
     controller.sync_pause(True)
     backend.paused = False
     backend.units[0].target = (400.0, 300.0)
-    assert "still changing" in controller.observe().text
+    assert "is changing although the game should be paused" in controller.observe().text
 
 
 def test_grid_overlay_changes_the_picture(controller):
@@ -224,9 +224,9 @@ def test_camera_actions(controller, backend):
 
 def test_advance_unpauses_runs_and_repauses(controller, backend):
     result = controller.advance(5, "fast", frames=2)
-    assert keys_pressed(backend) == ["space", "f3", "space"]
+    assert keys_pressed(backend) == ["f3", "f2", "space"], "the speed key starts it; normal speed, then pause, stops it"
     assert backend.paused is True and controller.paused is True
-    assert controller.pause_source == "tracked" and controller.speed == "fast"
+    assert controller.pause_source == "tracked"
     assert 9.5 <= backend.game_time <= 11.5, "about 5 s at double speed"
     assert len(result.images) == 2 and "strip of 2" in result.text
 
@@ -235,7 +235,7 @@ def test_advance_from_a_running_game_does_not_toggle_it_off(controller, backend)
     backend.paused = False
     controller.sync_pause(False)
     controller.advance(1, "normal", frames=0)
-    assert keys_pressed(backend) == ["f2", "space"]
+    assert keys_pressed(backend) == ["f2", "f2", "space"]
     assert backend.paused is True
 
 
@@ -249,7 +249,7 @@ def test_set_speed_pauses_a_game_found_running(controller, backend):
     backend.paused = False
     backend.units[0].target = (500.0, 300.0)
     controller.set_speed("pause")
-    assert backend.paused is True and keys_pressed(backend) == ["space"]
+    assert backend.paused is True and keys_pressed(backend) == ["f2", "space"]
 
 
 def test_set_speed_running_then_pause(controller, backend):
@@ -337,7 +337,7 @@ def test_panic_during_advance_sends_nothing_more(controller, backend, clock, mon
     monkeypatch.setattr(clock, "sleep", sleep)
     with pytest.raises(Halted):
         controller.advance(10, "normal")
-    assert keys_pressed(backend) == ["space", "f2"], "no pause key after the operator took over"
+    assert keys_pressed(backend) == ["f2"], "no pause key after the operator took over"
     assert controller.paused is None
 
 
@@ -702,7 +702,7 @@ def test_a_desktop_locked_during_advance_is_a_halt_that_says_the_game_runs_on(
         controller.advance(10, "normal")
     text = str(halted.value)
     assert text.startswith(HALT_MARKER) and "left running at normal speed" in text
-    assert keys_pressed(backend) == ["space", "f2"] and controller.paused is None
+    assert keys_pressed(backend) == ["f2"] and controller.paused is None
     assert not config.stop_file.exists()
 
 
@@ -733,7 +733,7 @@ def test_stop_checks_failing_during_advance_end_the_run_with_the_game_paused(
 
     after(clock, monkeypatch, 2.0, lambda: monkeypatch.setattr(backend, "cursor", broken))
     result = controller.advance(60, "normal")
-    assert keys_pressed(backend) == ["space", "f2", "space"] and backend.paused is True
+    assert keys_pressed(backend) == ["f2", "f2", "space"] and backend.paused is True
     assert clock.time < 5 and controller.paused is True
     assert "less than the 60s asked for" in result.text and "pointer position" in result.text
 
@@ -806,7 +806,7 @@ def test_describe_tells_a_missing_window_from_an_unusable_one(controller, backen
 def test_a_pause_request_cuts_an_advance_short_and_pauses(controller, backend, clock, monkeypatch):
     after(clock, monkeypatch, 2.0, controller.request_pause)
     result = controller.advance(60, "fast")
-    assert keys_pressed(backend) == ["space", "f3", "space"] and backend.paused is True
+    assert keys_pressed(backend) == ["f3", "f2", "space"] and backend.paused is True
     assert clock.time < 5 and "less than the 60s asked for, because a pause was asked for" in result.text
     monkeypatch.undo()
     backend.events.clear()
@@ -830,7 +830,7 @@ def test_shutdown_during_advance_pauses_the_game_and_skips_the_screenshot(
     after(clock, monkeypatch, 2.0, controller.shutdown)
     with pytest.raises(Interrupted, match="the game was paused"):
         controller.advance(60, "normal")
-    assert keys_pressed(backend) == ["space", "f2", "space"] and backend.paused is True
+    assert keys_pressed(backend) == ["f2", "f2", "space"] and backend.paused is True
     assert clock.time < 2.5, "no settling or screenshots on the way out"
     log = next(config.sessions_dir.glob("*.jsonl")).read_text(encoding="utf-8")
     assert "Shutting down: the run was stopped after 1." in log and "the game was paused" in log
@@ -896,3 +896,110 @@ def test_caps_lock_stops_letters_being_typed_in_the_wrong_case(controller, backe
     assert backend.events == []
     controller.type_text("12 34")  # Caps Lock does not change these
     assert backend.typed == "1234"
+
+
+# ---- pause: a belief the game can overtake ---------------------------------------------
+#
+# The stand-in's clock works as Kenshi's does: a speed key sets a speed outright and ends
+# a pause, the pause key toggles, and the game pauses and un-pauses by itself.
+
+
+def walking(backend) -> None:
+    """Give unit 1 somewhere far to go, so that the picture changes while the clock runs."""
+    backend.units[0].target = (4000.0, 3000.0)
+
+
+def test_a_wrong_belief_cannot_turn_a_resume_into_a_pause(controller, backend):
+    backend.paused = False  # it is running...
+    controller.sync_pause(True)  # ... and the record says paused
+    controller.advance(2, "normal", frames=0)
+    assert "space" not in keys_pressed(backend)[:1], "nothing toggles on the way in"
+    assert backend.game_time == pytest.approx(2, abs=0.5), "so the game ran for the whole of it"
+    assert backend.paused is True
+
+
+def test_a_wrong_belief_cannot_turn_a_pause_into_a_resume(controller, backend):
+    assert backend.paused  # the game paused itself; the record still says running
+    controller.sync_pause(False)
+    controller.set_speed("pause")
+    assert backend.paused is True and keys_pressed(backend) == ["f2", "space"]
+    assert backend.game_time < 0.5, "it ran only for the moment between the two keys"
+
+
+def test_a_game_that_pauses_itself_during_a_run_ends_paused_not_running(controller, backend, clock, monkeypatch):
+    walking(backend)
+    after(clock, monkeypatch, 2.0, backend.open_conversation)  # someone starts talking to the squad
+    result = controller.advance(6, "fast", frames=2)
+    assert backend.paused is True and controller.paused is True, "one press of the pause key would have started it"
+    assert "stopped changing before the end of the run" in result.text
+    assert backend.game_time < 6, "it stood still from the conversation on (it would be 12 s otherwise)"
+
+
+def test_a_game_that_unpauses_itself_is_noticed_at_the_next_action(controller, backend, clock, monkeypatch):
+    walking(backend)
+    after(clock, monkeypatch, 1.0, backend.open_conversation)
+    controller.advance(3, "normal")
+    backend.close_conversation()  # picking a reply closes the window, and the clock starts again
+    assert backend.paused is False and controller.paused is True
+    result = controller.click(300, 300)
+    assert "although the game should be paused" in result.text and "sync_pause(paused=false)" in result.text
+    assert "picture changing" in result.text.splitlines()[-1]
+    controller.sync_pause(False)
+    assert "Paused the game." in controller.set_speed("pause").text
+    assert backend.paused is True
+    assert "although" not in controller.click(300, 300).text
+
+
+def test_a_pause_the_picture_does_not_bear_out_is_reported_as_unknown(controller, backend, monkeypatch):
+    walking(backend)
+    key = backend.key
+    monkeypatch.setattr(backend, "key", lambda name, down: None)  # a state in which Kenshi takes no keys
+    backend.paused = False
+    result = controller.advance(2, "normal")
+    assert "THE GAME MAY STILL BE RUNNING" in result.text and "pause state unknown" in result.text
+    assert controller.paused is None, "the record does not claim a pause the picture contradicts"
+    monkeypatch.setattr(backend, "key", key)
+    assert "Paused the game." in controller.set_speed("pause").text
+    assert backend.paused is True and controller.paused is True
+
+
+def test_a_run_in_which_the_clock_never_started_says_so(controller, backend):
+    walking(backend)
+    backend.speed_keys_resume = False  # something is holding the game paused; speed keys do nothing
+    result = controller.advance(3, "normal")
+    assert "NOTHING ON SCREEN CHANGED during the run" in result.text
+    # The pause key then toggled a paused game: the one case no key order can cover. The
+    # picture gives it away, and the record is not left saying "paused".
+    assert backend.paused is False
+    assert "THE GAME MAY STILL BE RUNNING" in result.text and controller.paused is None
+    controller.set_speed("pause")
+    assert backend.paused is True and controller.paused is True
+
+
+def test_time_is_never_controlled_with_the_key_that_places_a_building(controller, backend):
+    result = controller.hotkey("build_mode")
+    assert backend.build_mode and backend.paused, "the build window pauses the game by itself"
+    assert "pauses itself when the build window opens" in result.text
+    assert controller.paused is True and controller.pause_source == "inferred", "nothing is assumed about it"
+    controller.advance(1, "normal")
+    assert backend.placed == 0 and not backend.build_mode, "the speed key closed the window before any Space"
+    controller.press_key("b")
+    controller.sync_pause(False)
+    controller.set_speed("pause")
+    assert backend.placed == 0 and backend.paused is True
+
+
+def test_pressing_a_speed_key_directly_is_recorded_as_running(controller, backend):
+    controller.sync_pause(True)
+    result = controller.press_key("f3")
+    assert backend.paused is False and controller.paused is False and controller.speed == "fast"
+    assert "ends a pause" in result.text and "RUNNING at fast speed" in result.text.splitlines()[-1]
+
+
+def test_set_speed_pause_presses_nothing_on_a_game_it_believes_paused_and_says_how_to_overrule(controller, backend):
+    controller.sync_pause(True)
+    result = controller.set_speed("pause")
+    assert keys_pressed(backend) == []
+    assert "sync_pause(paused=false)" in result.text
+    assert "Call set_speed('pause')" in controller.sync_pause(False).text
+

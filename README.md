@@ -32,6 +32,9 @@ is something Claude spends on purpose:
   of in-between frames plus the final screenshot.
 - Every action returns a screenshot taken afterwards, with a ring where a click landed, so
   Claude can check its own aim.
+- Kenshi also pauses and un-pauses by itself (a conversation, the build window, loading). The
+  tool pauses with a key sequence meant to end paused whatever the game was doing, and tells
+  Claude when the picture contradicts what it expects.
 
 Claude works from screenshots only. It cannot read game memory or save files, so numbers come
 from zooming in on the UI, and fast combat micro-management is out of reach.

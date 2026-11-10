@@ -3,6 +3,10 @@
 It draws an abstract test card (numbered dots on a grid) and reacts to the same
 kinds of input the controller sends a real game: pause toggling, speed keys,
 click-to-select, right-click-to-move, camera keys and the wheel.
+
+Where Kenshi's handling of an input is what makes it awkward to automate, the stand-in
+copies it: speed keys that set a speed outright while the pause key toggles, and pauses
+the game makes by itself (a conversation, the build window).
 """
 
 from __future__ import annotations
@@ -52,6 +56,12 @@ class MockBackend(Backend):
         self.heading = 0.0
         self.units = [Unit(1, -120, -40), Unit(2, 60, 80), Unit(3, 200, -150)]
         self.menu: tuple[int, int] | None = None
+        self.resume_speed = 1.0  # what the pause key goes back to
+        self.conversation = False  # a conversation window is open, which holds the game paused
+        self._before_conversation: bool | None = None
+        self.build_mode = False  # the build window is open: Space places, it does not pause
+        self.placed = 0  # buildings placed with Space in build mode
+        self.speed_keys_resume = True  # False stands in for a state in which the speed keys are ignored
         self.typed = ""
         self.log: list[str] = []
         self.events: list[tuple] = []
@@ -103,6 +113,20 @@ class MockBackend(Backend):
             else:
                 unit.x += dx / distance * step
                 unit.y += dy / distance * step
+
+    # ---- what the game does to its own clock ------------------------------------
+
+    def open_conversation(self) -> None:
+        """A conversation window opens: the game pauses itself until it closes."""
+        self.conversation, self._before_conversation = True, self.paused
+        self.paused = True
+
+    def close_conversation(self) -> None:
+        """... and goes back to how it was, which un-pauses a game that had been running."""
+        self.conversation = False
+        if self._before_conversation is False:
+            self.paused = False
+        self._before_conversation = None
 
     def _to_window(self, wx: float, wy: float) -> tuple[float, float]:
         return (
@@ -234,9 +258,22 @@ class MockBackend(Backend):
             return
         self._held_keys[key] = self.clock.now()
         if key == "space":
-            self.paused = not self.paused
+            if self.build_mode:
+                self.placed += 1  # in build mode this key confirms the placement
+                self._note("building placed")
+            elif self.paused:
+                self.paused, self.speed = False, self.resume_speed
+            else:
+                self.paused, self.resume_speed = True, self.speed
         elif key in _SPEED_KEYS:
-            self.speed = _SPEED_KEYS[key]
+            if self.speed_keys_resume:
+                # A speed key sets that speed outright, which ends a pause; it also closes
+                # the build window.
+                self.speed, self.paused, self.build_mode = _SPEED_KEYS[key], False, False
+        elif key == "b":
+            self.build_mode = not self.build_mode
+            if self.build_mode and not self.paused:
+                self.paused, self.resume_speed = True, self.speed  # opening it pauses the game
         elif key in "1234567890" and len(key) == 1:
             index = 10 if key == "0" else int(key)
             for unit in self.units:
@@ -246,6 +283,7 @@ class MockBackend(Backend):
                 unit.selected = True
         elif key == "escape":
             self.menu = None
+            self.build_mode = False
         if len(key) == 1 and key.isalnum():
             self.typed += key.upper() if "shift" in self._held_keys else key
 
@@ -321,6 +359,12 @@ class MockBackend(Backend):
             draw.rectangle([mx, my, mx + 160, my + 60], fill=(20, 20, 24), outline=(220, 220, 220))
             draw.text((mx + 10, my + 6), "Option 1", fill=(240, 240, 240), font=small)
             draw.text((mx + 10, my + 36), "Option 2", fill=(240, 240, 240), font=small)
+
+        for i, label in enumerate(
+            text for text, shown in (("BUILD MODE", self.build_mode), ("CONVERSATION", self.conversation))
+            if shown
+        ):
+            draw.text((self.width - 170, 34 + i * 22), label, fill=(240, 190, 60), font=small)
 
         status = f"kenshi-link mock   t={self.game_time:6.1f}s   speed x{self.speed:g}   zoom {self.zoom:.2f}"
         draw.rectangle([0, 0, self.width, 26], fill=(18, 20, 24))

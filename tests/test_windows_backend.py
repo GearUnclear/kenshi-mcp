@@ -209,6 +209,13 @@ def test_a_click_where_another_window_covers_the_game_is_not_sent(game, window_l
         stop_window(overlay)
 
 
+def test_time_is_set_with_keys_that_cannot_be_inverted(game, window_log):
+    game.advance(0.5, "fast", frames=0)
+    seen = wait_for(window_log, lambda seen: sum(e["type"] == "key" and not e["down"] for e in seen) >= 3)
+    # F3 starts the clock; F2 and then Space stop it, whatever the game did in between.
+    assert [e["vk"] for e in seen if e["type"] == "key" and e["down"]] == [0x72, 0x71, 0x20]
+
+
 def test_a_window_hanging_off_the_desktop_is_refused(game, monkeypatch):
     left, top, width, height = game.backend.screen_rect()
     monkeypatch.setattr(game.backend, "screen_rect", lambda: (left, top, LEFT + WIDTH - 10, height))

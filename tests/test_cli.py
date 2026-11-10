@@ -60,7 +60,7 @@ def test_output_the_console_encoding_lacks_does_not_stop_a_command(home, tmp_pat
     assert cli.main(["doctor", "--screenshot", str(tmp_path / "check.jpg")]) == 0
     sys.stdout.flush()
     last = raw.getvalue().decode(encoding).splitlines()[-1]
-    assert last.startswith("[game PAUSED (inferred) ? speed unknown ? screenshot 1280x720")
+    assert last.startswith("[game PAUSED (inferred) ? screenshot 1280x720 ? picture changing")
 
 
 def test_printing_claudes_words_cannot_fail(monkeypatch):

@@ -106,12 +106,13 @@ def test_right_click_hold_and_shift_modifier(game, window_log):
 def test_keys_reach_the_window_with_the_right_symbols(game, window_log):
     game.press_key("f2")
     game.hotkey("inventory")
-    game.set_speed("normal")  # unknown state, static picture -> inferred paused -> space then f2
+    game.set_speed("fast")  # the speed key alone: it sets that speed whatever the game was doing
+    game.set_speed("pause")  # normal speed, then the pause key
     events = _wait_for(
-        window_log, lambda ev: sum(e["type"] == "key" and e["down"] for e in ev) >= 4
+        window_log, lambda ev: sum(e["type"] == "key" and e["down"] for e in ev) >= 5
     )
     downs = [e["keysym"] for e in events if e["type"] == "key" and e["down"]]
-    assert downs == [0xFFBF, ord("i"), ord(" "), 0xFFBF]  # F2, i, space, F2
+    assert downs == [0xFFBF, ord("i"), 0xFFC0, 0xFFBF, ord(" ")]  # F2, i, F3, F2, space
 
 
 def test_typing_uses_shift_for_capitals(game, window_log):
