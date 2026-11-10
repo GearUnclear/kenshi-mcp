@@ -155,7 +155,21 @@ Other guard rails:
 | `advance` | Run the game for N seconds at a chosen speed, then pause and report |
 | `set_speed`, `sync_pause` | Pause or run the clock; correct the tracked pause state |
 | `notes_read`, `notes_write` | A notes file that persists between conversations |
+| `lookup`, `lookup_topics` | Search and browse the built-in reference on the game |
 | `manual` | A guide to Kenshi's controls and screen layout, read on demand |
+
+## Game reference
+
+The package includes a reference on Kenshi for Claude to search instead of guessing: 16
+Markdown files, about 850 short sections, in `src/kenshi_link/knowledge/`. They cover regions
+and towns, factions, wildlife, law, recruits, races, stats, combat, health, game starts,
+money-making, items, research and building, the interface, and step-by-step how-tos.
+
+The facts come from the [Kenshi wiki](https://kenshi.fandom.com/) and from the documentation
+of the [MeitouClient](https://github.com/VlcekM/meitouclient) project, written in our own
+words. Each file lists its sources at the end, and a fact that could not be confirmed in a
+source is marked "(unverified)". The reference describes the unmodded game. Like the rest, it
+has not been checked against a running copy.
 
 ## Configuration
 

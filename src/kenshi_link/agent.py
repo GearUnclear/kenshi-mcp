@@ -244,6 +244,9 @@ class Agent:
                         "trigger": {"type": "input_tokens", "value": options.clear_trigger_tokens},
                         "keep": {"type": "tool_uses", "value": options.clear_keep_tool_uses},
                         "clear_at_least": {"type": "input_tokens", "value": options.clear_at_least_tokens},
+                        # The notes and the guide are kept for good. What lookup returns is
+                        # not: it is cheap to ask for again, and anything worth keeping
+                        # belongs in the notes, which outlive the conversation.
                         "exclude_tools": ["notes_read", "manual"],
                     }
                 ]
@@ -391,7 +394,9 @@ class Agent:
                     text = self._text_of(content)
                     self._say("     " + (text.splitlines()[0] if text else "(image)"))
                     self._record("tool", name=call.name, input=call.input, is_error=is_error, text=text)
-                    if HALT_MARKER in text:
+                    # A stop reaches us as a failed game action. Text that merely mentions the
+                    # marker (a page of the guide or the reference, the notes) is not a stop.
+                    if is_error and HALT_MARKER in text:
                         halted = text
                 results.append(
                     {"type": "tool_result", "tool_use_id": call.id, "content": content, "is_error": is_error}

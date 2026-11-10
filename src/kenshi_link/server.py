@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from . import knowledge
 from .config import Config, load_config
 from .controller import ControlError, Controller, Result, read_notes, write_notes
 from .manual import INSTRUCTIONS, TOPICS
@@ -351,6 +352,47 @@ def build_server(
         """
         size = await session.run_plain(write_notes, config.notes_file, text, mode)
         return f"Notes saved ({size} characters in the file)."
+
+    @tool()
+    async def lookup(
+        query: Annotated[
+            str,
+            Field(
+                description="A few words for what you want to know: a place, item, creature, "
+                "faction, button, or what you are trying to do."
+            ),
+        ],
+        limit: Annotated[int, Field(description="The most sections to return.", ge=1, le=8)] = 4,
+    ) -> str:
+        """Look something up in the built-in reference on Kenshi.
+
+        Returns the few reference sections that best match, most relevant first. The
+        reference covers towns and regions, factions, creatures, items and prices, stats
+        and training, health, crime, crafting, the game's interface and step-by-step
+        procedures. Use it before guessing how the game works, where something is or what a
+        button does, for example "where to sell copper ore near the Hub", "stop bleeding"
+        or "what does the Hold button do". The game's own names work best. A fact marked
+        (unverified) is a lead to check on screen, not something to rely on. If nothing
+        matches, the result lists the closest headings; lookup_topics shows what is covered.
+        """
+        return await session.run_plain(knowledge.search, query, limit)
+
+    @tool()
+    async def lookup_topics(
+        file: Annotated[
+            str,
+            Field(
+                description="Part of a file's name or title, such as 'combat' or 'towns', to "
+                "list all of its headings. Leave empty for the whole index."
+            ),
+        ] = "",
+    ) -> str:
+        """List what the Kenshi reference covers: each file's subject and its section headings.
+
+        The whole index shows the first headings of each file and how many more there are;
+        give file to see one file's full list. Any heading works as a lookup query.
+        """
+        return await session.run_plain(knowledge.topics, 12000, file)
 
     @tool(
         description=(

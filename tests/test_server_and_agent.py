@@ -57,8 +57,10 @@ async def test_server_lists_tools_and_returns_screenshots(tmp_path):
         tools = {tool.name for tool in (await session.list_tools()).tools}
         assert tools == {
             "observe", "zoom", "click", "drag", "scroll", "press_key", "type_text", "hotkey",
-            "camera", "advance", "set_speed", "sync_pause", "notes_read", "notes_write", "manual",
+            "camera", "advance", "set_speed", "sync_pause", "notes_read", "notes_write",
+            "lookup", "lookup_topics", "manual",
         }
+        assert "lookup(query)" in init.instructions and "lookup_topics" in init.instructions
 
         observed = await session.call_tool("observe", {})
         assert [c.type for c in observed.content] == ["text", "image"] and not is_error(observed)
@@ -89,6 +91,43 @@ async def test_notes_persist_and_manual_reads(tmp_path):
         assert "Reach the Hub" in (await session.call_tool("notes_read", {})).content[0].text
         assert "KENSHI CONTROLS" in (await session.call_tool("manual", {"topic": "controls"})).content[0].text
     assert "Reach the Hub" in (tmp_path / "notes.md").read_text()
+
+
+# ---- the reference ---------------------------------------------------------------------
+
+
+async def test_the_reference_is_searched_and_indexed_through_the_server(tmp_path):
+    async with mcp_session(tmp_path) as session:
+        await session.initialize()
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        assert "lookup_topics" in tools["lookup"].description, "a search that finds nothing points at the index"
+
+        found = await session.call_tool("lookup", {"query": "stop bleeding"})
+        text = found.content[0].text
+        assert not is_error(found) and [c.type for c in found.content] == ["text"]
+        assert text.startswith("## ") and "bandage" in text.lower() and len(text) <= 6000
+
+        one = await session.call_tool("lookup", {"query": "The Hub", "limit": 1})
+        assert one.content[0].text.count("\n## ") == 0 and one.content[0].text.startswith("## ")
+
+        missed = await session.call_tool("lookup", {"query": "Skuin"})
+        assert not is_error(missed) and "Closest headings:" in missed.content[0].text
+        assert "Squin" in missed.content[0].text
+        empty = await session.call_tool("lookup", {"query": "?!"})
+        assert not is_error(empty) and "Nothing to look up" in empty.content[0].text
+
+        index = await session.call_tool("lookup_topics", {})
+        assert index.content[0].text.startswith("Kenshi reference: ") and "16 files" in index.content[0].text
+        assert len(index.content[0].text) <= 12000
+        combat = await session.call_tool("lookup_topics", {"file": "combat"})
+        assert 'in 1 file matching "combat"' in combat.content[0].text
+        assert "and " not in combat.content[0].text.splitlines()[-1][-12:], "one file is listed in full"
+        nowhere = await session.call_tool("lookup_topics", {"file": "spaceships"})
+        assert not is_error(nowhere) and "The files are:" in nowhere.content[0].text
+
+        bad = await session.call_tool("lookup", {"query": "the hub", "limit": 0})
+        assert is_error(bad)
+    assert not (tmp_path / "sessions").exists(), "looking something up does not touch the game"
 
 
 async def test_stop_file_halts_the_server(tmp_path):
@@ -232,7 +271,7 @@ async def test_agent_plays_a_scripted_session(tmp_path):
     betas = api.headers[0]["anthropic-beta"]
     assert "context-management-2025-06-27" in betas and "server-side-fallback-2026-07-01" in betas
     names = [tool["name"] for tool in first["tools"]]
-    assert names[-1] == "end_session" and names[:-1] == sorted(names[:-1]) and len(names) == 16
+    assert names[-1] == "end_session" and names[:-1] == sorted(names[:-1]) and len(names) == 18
     assert "Select unit 2" in first["messages"][0]["content"]
 
     # The history is append-only and the prefix (system, tools) never changes.
@@ -286,6 +325,20 @@ async def test_agent_stops_when_the_operator_halts(tmp_path):
     ])
     assert outcome.reason == "halted" and HALT_MARKER in outcome.report
     assert outcome.steps == 1, "the second call was not sent to the game"
+
+
+async def test_agent_looks_things_up_and_is_not_stopped_by_text_that_mentions_a_stop(tmp_path):
+    quoted = f"If a result contains {HALT_MARKER}, the operator has stopped the session."
+    api, outcome = await run_agent(tmp_path, [
+        {"content": [call(1, "lookup", query="stop bleeding"), call(2, "notes_write", text=quoted)]},
+        {"content": [call(3, "notes_read")]},  # hands the marker back: a note, not a stop
+        {"content": [call(4, "end_session", report="Done.")]},
+    ])
+    assert outcome.reason == "ended" and outcome.steps == 3
+    looked_up = api.requests[1]["messages"][2]["content"][0]
+    assert looked_up["is_error"] is False and looked_up["content"][0]["text"].startswith("## ")
+    read_back = api.requests[2]["messages"][4]["content"][0]
+    assert HALT_MARKER in read_back["content"][0]["text"] and read_back["is_error"] is False
 
 
 async def test_agent_reports_a_refusal_and_gives_up_on_silence(tmp_path):

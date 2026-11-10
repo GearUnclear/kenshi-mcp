@@ -34,6 +34,14 @@ cannot read cleanly, and observe(grid=true) when you need help judging positions
 pause and speed, not something read from the game. The screenshot is the truth: if they \
 disagree, fix the belief with sync_pause.
 
+Knowing the game
+- lookup(query) searches a built-in reference on Kenshi: places, factions, creatures, items \
+and prices, health, crime, building, the interface, step-by-step how-tos. Use it before you \
+guess: to plan a trip, on meeting a faction or creature, to learn what a button does, or when \
+an order did not do what you expected. lookup_topics lists what it covers.
+- The screen outranks the reference, a fact it marks (unverified) is only a lead, and on how \
+to send an input the tool descriptions outrank it.
+
 Limits
 - Input is sent only while the Kenshi window has focus, and only keys that stay inside the game.
 - If a result contains KENSHI_LINK_HALTED, the operator has stopped the session or their PC is \
