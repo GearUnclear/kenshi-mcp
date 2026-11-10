@@ -1,0 +1,80 @@
+# kenshi-link settings. Every setting is optional; the values shown are the defaults.
+#
+# On Windows this file goes in your user folder, as
+#   %USERPROFILE%\.kenshi-link\config.toml     for example C:\Users\you\.kenshi-link\config.toml
+# To copy it there, run these two lines in PowerShell from the kenshi-link folder:
+#   New-Item -ItemType Directory -Force "$HOME\.kenshi-link"
+#   Copy-Item config.example.toml "$HOME\.kenshi-link\config.toml"
+# Then open the copy (Notepad will do) and remove the "# " in front of each setting you want
+# to change. `kenshi-link doctor` prints which config file it read.
+# (On Linux the file is ~/.kenshi-link/config.toml.)
+#
+# Two things to watch when editing on Windows:
+# - A value that contains backslashes (the regular expressions below, or any Windows path such
+#   as 'C:\Users\you\Documents') must be in single quotes. In double quotes a backslash starts
+#   an escape sequence and the file is rejected.
+# - Save the file as UTF-8 without a byte-order mark. If kenshi-link then reports
+#   "Invalid statement (at line 1, column 1)", the editor added one.
+
+# Which game interface to use. "auto" means windows on Windows and x11 on Linux; "mock" is the
+# built-in stand-in for trying things without the game.
+# backend = "auto"            # auto | windows | x11 | mock
+
+# Screenshots sent to Claude are scaled so the long edge is at most this many pixels.
+# Larger is sharper but costs more per turn (limit 2576).
+# max_long_edge = 1280
+# image_format = "jpeg"       # jpeg | png
+# jpeg_quality = 80
+
+# Seconds to wait after an input before taking the screenshot.
+# settle_seconds = 0.35
+
+# Longest single advance() Claude may ask for, in real seconds.
+# max_advance_seconds = 120.0
+
+# Safety
+# auto_focus = true           # bring Kenshi to the front when it has lost focus
+# failsafe_corner = true      # mouse in the top-left corner of the primary screen stops everything
+# panic_key = true            # holding Pause/Break stops everything
+# allow_debug_keys = false    # permit Kenshi's debug shortcuts (Shift+F12 etc.)
+
+# Keep every screenshot for later review, in
+# %USERPROFILE%\.kenshi-link\sessions\<date-time>\ (00001.jpg, 00002.jpg, ...).
+# save_frames = false
+
+# Finding the window. Change these only if your install is unusual.
+# Windows: the file name of the program that owns the game window. The default matches any
+# name that starts with "kenshi" and ends in ".exe".
+# process_regex = '(?i)^kenshi.*\.exe$'
+# Linux only: the window's WM_CLASS.
+# x11_class_regex = '(?i)kenshi|steam_app_233860'
+
+# Kenshi's key bindings. List only the ones you have changed in Options > Controls.
+# Key names: letters, digits, f1-f12, space, enter, escape, tab, backspace, delete, insert,
+# home, end, pageup, pagedown, up, down, left, right, grave (the ` key), minus, equals, comma,
+# period, slash, semicolon, apostrophe, lbracket, rbracket, backslash, shift, ctrl, alt.
+# Combine with "+", for example "shift+f5". On Windows a name stands for the physical key that
+# carries that label on a US keyboard.
+[keymap]
+# pause = "space"
+# speed_normal = "f2"
+# speed_fast = "f3"
+# speed_fastest = "f4"
+# camera_forward = "w"
+# camera_back = "s"
+# camera_left = "a"
+# camera_right = "d"
+# camera_rotate_left = "q"
+# camera_rotate_right = "e"
+# inventory = "i"
+# map = "m"
+# stats = "c"
+# research = "t"
+# crafting = "y"
+# build_mode = "b"
+# select_all = "grave"
+# next_squad = "tab"
+# quick_save = "f5"
+# quick_load = "f9"
+# highlight_items = "alt"
+# close = "escape"

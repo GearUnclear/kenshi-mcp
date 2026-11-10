@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kenshi-link"
+version = "0.1.0"
+description = "MCP server and agent harness that lets Claude see and play Kenshi"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.9",
+    "pillow>=10.1",
+    "mss>=9",
+    "python-xlib>=0.33; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+agent = ["anthropic>=2.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "anthropic>=2.0"]
+
+[project.scripts]
+kenshi-link = "kenshi_link.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kenshi_link"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "x11: needs an X display (run under xvfb-run)",
+]
