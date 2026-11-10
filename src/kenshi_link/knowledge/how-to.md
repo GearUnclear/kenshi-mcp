@@ -5,7 +5,7 @@ Numbered mouse-and-keyboard procedures for the unmodded 1.0.x game (selecting, o
 ## Sending these inputs through kenshi-link
 Also: tool calls, hold right click, modifiers, shift click, alt click, double click
 - Plain right-click: click with button "right". Its press is too short to open the action menu, which needs 0.2 s.
-- Action menu: the list is open only while the right button is down (code analysis), so click with hold_seconds opens it and closes it again with nothing chosen. Use drag with button "right" from the target to the wanted row; see "Open the action menu on a target".
+- Action menu: the list is open only while the right button is down (code analysis), so click with hold_seconds opens it and closes it again with nothing chosen. Use menu_open on the target, read the list in the returned screenshot, then menu_choose on the wanted row or menu_cancel; see "Open the action menu on a target".
 - Shift+right-click (job): click with button "right" and modifiers "shift".
 - Alt+right-click (steal, lockpick): click with button "right" and modifiers "alt".
 - Double-click: click with count 2.
@@ -83,7 +83,7 @@ Also: right click, default order, what does right-click do, quick click
 
 ## Getting things done without the action menu
 Also: avoid hold menu, quick click alternatives, default order, buttons instead of menu
-- kenshi-link cannot show the hold menu before choosing from it, so prefer these routes (code analysis unless marked).
+- These routes need no action menu and are quicker than menu_open and menu_choose (code analysis unless marked).
 - Loot a body: plain right-click a downed stranger.
 - Pick up your own downed character: plain right-click them once nothing is left to bandage. Put down: plain right-click the carried body.
 - First aid: plain right-click a wounded squad member, or click MEDIC (wiki).
@@ -98,11 +98,12 @@ Also: avoid hold menu, quick click alternatives, default order, buttons instead 
 ## Open the action menu on a target
 Also: hold right click, context menu, more actions, radial menu
 1. Select the character who should act.
-2. Use drag with button "right" from the target (character, portrait, body, building, door, bed, container) to where the wanted row will be. Expect: the order is given if the release lands on that row; otherwise the list just closes.
-3. Check the character's "Goal:" line or jobs list to see which order was taken.
-- The list's top-left corner is at the pointer: a title with the target's name, then the rows downward, ordered as in "Action menu entries" in the interface reference (code analysis). Aim below and a little right of the press point.
-- The button must rest on the target for 0.2 s (0.25 s on a portrait) before the list opens; a drag that leaves a small target sooner may open nothing (inference from the code analysis).
-- Row height is not documented; a jobs-list row is 24 px at 1080p, so try steps of about that and note what works (unverified)
+2. Call menu_open on the target (character, portrait, body, building, door, bed, container). Expect: a screenshot with the list showing and the right button still held.
+3. Call menu_choose on the wanted row, or menu_cancel to close the list without choosing. Expect: the order is given if the release lands on a row.
+4. Check the character's "Goal:" line or jobs list to see which order was taken.
+- The list's top-left corner is at the pointer: a title with the target's name, then the rows downward, ordered as in "Action menu entries" in the interface reference (code analysis).
+- The button must rest on the target for 0.2 s (0.25 s on a portrait) before the list opens (code analysis); menu_open waits longer than that.
+- If the screenshot shows no list, nothing opened: menu_cancel, then try a plain right-click or a different target.
 
 ## Does the action menu stay open after release
 Also: menu vanished, menu disappears, release right button, drag to option
@@ -110,7 +111,7 @@ Also: menu vanished, menu disappears, release right button, drag to option
 - A left-click on a row also works, but only while the right button is still down.
 - One Steam answer agrees: "You have to hold the right-click as you drag the cursor to the menu option you want."
 - Other player answers say "hold right click and then click" the entry, and patch notes say the menu on a locked door opens instantly on a right-click. Neither shows that it survives the release.
-- So through kenshi-link a click with hold_seconds can never choose an entry; only a right-button drag can.
+- So through kenshi-link a click with hold_seconds can never choose an entry; menu_open and menu_choose hold the button for you between calls.
 - If a screenshot ever shows the list still open after a release, this install behaves differently: left-click the entry and record that in your notes.
 
 ## Give a standing job with Shift
