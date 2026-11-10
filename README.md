@@ -19,8 +19,11 @@ Early. It was built and tested on a machine without the game:
 - It has not yet been run against Kenshi itself, on native Windows, or against the live
   Claude API.
 
-Key bindings and mouse conventions come from the game's published defaults. Expect the first
-real session to turn up things that need tuning. Reports of what breaks are welcome.
+Key bindings come from the game's published defaults. How Kenshi handles input (its action
+menu, pausing, edge scrolling, Escape) is taken from the wiki and from a third-party analysis
+of the game, and the stand-in window was made to behave the same way. None of that has been
+checked against the game. Expect the first real session to turn up things that need tuning.
+Reports of what breaks are welcome.
 
 ## How it works
 
@@ -133,8 +136,8 @@ Any of these disables all input until you allow it again:
 - Run `kenshi-link stop` from another PowerShell window.
 - Tap Pause/Break, if your keyboard has it.
 
-A stop takes effect within moments, including in the middle of typing, a drag or a held key.
-`kenshi-link resume` allows input again.
+A stop takes effect within moments, including in the middle of typing, a drag, a held key or
+an open action menu. `kenshi-link resume` allows input again.
 
 Other guard rails:
 
@@ -145,6 +148,8 @@ Other guard rails:
   Steam overlay and similar) are refused, as are Kenshi's debug shortcuts.
 - Escape is only sent when Claude states that a game is loaded: on the title screen it quits
   Kenshi without asking.
+- The right button, held while the action menu is open, is released by any other action, a
+  stop, shutdown, or 30 seconds without a choice.
 - The pointer is not left resting on the edge of the window, where it scrolls the camera.
 - If Kenshi is running as administrator and this is not, it says so instead of failing silently.
 
@@ -154,7 +159,8 @@ Other guard rails:
 |---|---|
 | `observe` | Screenshot, optionally with a coordinate grid |
 | `zoom` | Enlarges a region at full resolution, for reading small text |
-| `click`, `drag`, `scroll` | Pointer input in screenshot coordinates. A held right-click opens Kenshi's action menu |
+| `click`, `drag`, `scroll` | Pointer input in screenshot coordinates |
+| `menu_open`, `menu_choose`, `menu_cancel` | Kenshi's action menu, which shows only while the right button is held: hold it and see the menu in a screenshot, then release over an entry or cancel |
 | `press_key`, `type_text` | Keyboard input, limited to keys that stay inside the game |
 | `hotkey` | Named actions through your key bindings: inventory, map, stats, research, build mode, squad selection, quick save and load |
 | `camera` | Pan, rotate, zoom and tilt |

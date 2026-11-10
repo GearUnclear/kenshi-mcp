@@ -56,7 +56,7 @@ SPEEDS = ("pause", "normal", "fast", "fastest")
 _DURATIONS = (
     "settle_seconds", "click_hold_seconds", "key_hold_seconds", "pointer_dwell_seconds",
     "modifier_gap_seconds", "mouse_move_seconds", "drag_seconds", "motion_probe_seconds",
-    "max_advance_seconds", "max_hold_seconds",
+    "max_advance_seconds", "max_hold_seconds", "menu_hold_seconds", "menu_timeout_seconds",
 )
 
 
@@ -97,6 +97,12 @@ class Config:
     max_advance_seconds: float = 120.0
     max_hold_seconds: float = 10.0
     halt_poll_seconds: float = 0.1  # how often a running advance or a long hold checks for a stop
+
+    # Kenshi's action menu exists only while the right button is held. menu_open holds it
+    # this long before the screenshot (the game opens the menu after 0.2 s, 0.25 s on a
+    # portrait), and lets go by itself if no choice has been made after the time limit.
+    menu_hold_seconds: float = 0.5
+    menu_timeout_seconds: float = 30.0
 
     # Above this share of pixels changing between two frames, the scene is "moving".
     motion_threshold: float = 0.0001
@@ -144,6 +150,10 @@ class Config:
                 raise ValueError(f"{name} cannot be negative")
         if not 0.01 <= self.halt_poll_seconds <= 1:
             raise ValueError("halt_poll_seconds must be between 0.01 and 1")
+        if not 0.3 <= self.menu_hold_seconds <= self.max_hold_seconds:
+            raise ValueError("menu_hold_seconds must be between 0.3 and max_hold_seconds")
+        if not 1 <= self.menu_timeout_seconds <= 600:
+            raise ValueError("menu_timeout_seconds must be between 1 and 600")
         for action, combo in self.keymap.items():
             try:
                 mods, key = parse_combo(combo)

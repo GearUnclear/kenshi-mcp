@@ -7,6 +7,7 @@ import asyncio
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -34,9 +35,10 @@ import httpx2  # noqa: E402  (the HTTP library the Anthropic SDK is built on)
 
 
 @asynccontextmanager
-async def mcp_session(home):
+async def mcp_session(home, **settings):
     env = {**os.environ, "KENSHI_LINK_BACKEND": "mock", "KENSHI_LINK_HOME": str(home),
-           "KENSHI_LINK_SETTLE_SECONDS": "0.02", "KENSHI_LINK_MOTION_PROBE_SECONDS": "0.05"}
+           "KENSHI_LINK_SETTLE_SECONDS": "0.02", "KENSHI_LINK_MOTION_PROBE_SECONDS": "0.05",
+           **{f"KENSHI_LINK_{name.upper()}": str(value) for name, value in settings.items()}}
     parameters = StdioServerParameters(command=sys.executable, args=["-m", "kenshi_link.server"], env=env)
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
@@ -45,6 +47,15 @@ async def mcp_session(home):
 
 def is_error(result) -> bool:
     return bool(getattr(result, "is_error", getattr(result, "isError", False)))
+
+
+def game_log(home) -> list[dict]:
+    """What the server's controller did, in order, from the log it keeps."""
+    return [json.loads(line) for path in sorted((home / "sessions").glob("2*.jsonl"))
+            for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+UNIT_2, ROW_2 = {"x": 688, "y": 424}, {"x": 720, "y": 479}  # the stand-in's unit 2 and a row of its menu
 
 
 # ---- the MCP server ------------------------------------------------------------
@@ -56,9 +67,9 @@ async def test_server_lists_tools_and_returns_screenshots(tmp_path):
         assert "advance(seconds, speed)" in init.instructions
         tools = {tool.name for tool in (await session.list_tools()).tools}
         assert tools == {
-            "observe", "zoom", "click", "drag", "scroll", "press_key", "type_text", "hotkey",
-            "camera", "advance", "set_speed", "sync_pause", "notes_read", "notes_write",
-            "lookup", "lookup_topics", "manual",
+            "observe", "zoom", "click", "drag", "scroll", "menu_open", "menu_choose", "menu_cancel",
+            "press_key", "type_text", "hotkey", "camera", "advance", "set_speed", "sync_pause",
+            "notes_read", "notes_write", "lookup", "lookup_topics", "manual",
         }
         assert "lookup(query)" in init.instructions and "lookup_topics" in init.instructions
 
@@ -132,6 +143,100 @@ async def test_the_reference_is_searched_and_indexed_through_the_server(tmp_path
         bad = await session.call_tool("lookup", {"query": "the hub", "limit": 0})
         assert is_error(bad)
     assert not (tmp_path / "sessions").exists(), "looking something up does not touch the game"
+
+
+# ---- the action menu, held from one call to the next --------------------------------------
+
+
+async def test_the_action_menu_is_opened_looked_at_and_chosen_from_over_three_calls(tmp_path):
+    async with mcp_session(tmp_path) as session:
+        await session.initialize()
+        opened = await session.call_tool("menu_open", UNIT_2)
+        assert [c.type for c in opened.content] == ["text", "image"] and not is_error(opened)
+        assert "IT IS STILL DOWN" in opened.content[0].text
+        zoomed = await session.call_tool("zoom", {"x0": 660, "y0": 400, "x1": 860, "y1": 520})
+        assert "RIGHT BUTTON HELD" in zoomed.content[0].text
+        await session.call_tool("lookup", {"query": "action menu entries"})  # reading up does not let go
+        await asyncio.sleep(0.5)  # ... nor does thinking it over, with the watchdog looking on
+        chosen = await session.call_tool("menu_choose", ROW_2)
+        assert not is_error(chosen) and "released it there" in chosen.content[0].text
+        assert "RIGHT BUTTON" not in chosen.content[0].text
+        # The stand-in writes what it was told on its screen; that line is in the log of results.
+        again = await session.call_tool("menu_cancel", {})
+        assert "No action menu was being held" in again.content[0].text
+    assert [record["action"] for record in game_log(tmp_path)] == ["menu_open", "zoom", "menu_choose", "menu_cancel"]
+
+
+async def test_a_menu_that_is_not_come_back_to_is_let_go_by_the_server_itself(tmp_path):
+    async with mcp_session(tmp_path, menu_timeout_seconds=1) as session:
+        await session.initialize()
+        opened = time.time()
+        await session.call_tool("menu_open", UNIT_2)
+        await asyncio.sleep(2.0)  # no call is made: only the watchdog can have done this
+        released = [record for record in game_log(tmp_path) if record["action"] == "menu_release"]
+        assert len(released) == 1 and "held for 1s" in released[0]["result"]
+        assert released[0]["time"] - opened < 1.9
+        late = await session.call_tool("menu_choose", ROW_2)
+        assert is_error(late) and "No action menu is being held" in late.content[0].text
+        assert "held for 1s" in late.content[0].text
+
+
+async def test_an_operator_stop_lets_go_of_a_held_menu_without_waiting_for_a_call(tmp_path):
+    async with mcp_session(tmp_path) as session:
+        await session.initialize()
+        await session.call_tool("menu_open", UNIT_2)
+        (tmp_path / "STOP").write_text("operator stop\n")
+        await asyncio.sleep(0.6)
+        released = [record for record in game_log(tmp_path) if record["action"] == "menu_release"]
+        assert len(released) == 1 and "the operator stopped the session" in released[0]["result"]
+        halted = await session.call_tool("menu_choose", ROW_2)
+        assert is_error(halted) and HALT_MARKER in halted.content[0].text
+
+
+async def test_another_tool_call_lets_go_of_a_held_menu(tmp_path):
+    async with mcp_session(tmp_path) as session:
+        await session.initialize()
+        await session.call_tool("menu_open", UNIT_2)
+        paused = await session.call_tool("set_speed", {"speed": "pause"})
+        assert "closed without a choice: the button was released first" in paused.content[0].text
+        late = await session.call_tool("menu_choose", ROW_2)
+        assert is_error(late) and "No action menu is being held" in late.content[0].text
+
+
+@pytest.mark.parametrize("ending", ["stdin closed", "terminated"])
+def test_a_menu_held_when_the_server_is_shut_down_is_let_go(tmp_path, ending):
+    """Both ways an MCP client ends a server: it closes the server's stdin, and if that is
+    not enough it asks the process to terminate. Neither may leave the button down."""
+    if ending == "terminated" and sys.platform == "win32":
+        pytest.skip("Windows ends a process without a signal it could act on")
+    env = {**os.environ, "KENSHI_LINK_BACKEND": "mock", "KENSHI_LINK_HOME": str(tmp_path),
+           "KENSHI_LINK_SETTLE_SECONDS": "0.02", "KENSHI_LINK_MOTION_PROBE_SECONDS": "0.05"}
+    server = subprocess.Popen([sys.executable, "-m", "kenshi_link.server"], env=env, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def send(message: dict) -> None:
+        server.stdin.write((json.dumps(message) + "\n").encode())
+        server.stdin.flush()
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
+        assert b'"result"' in server.stdout.readline()
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "menu_open", "arguments": UNIT_2}})
+        assert b"IT IS STILL DOWN" in server.stdout.readline()
+        if ending == "stdin closed":
+            server.stdin.close()
+        else:
+            server.send_signal(signal.SIGTERM)
+        server.wait(timeout=10)
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
+    records = game_log(tmp_path)
+    assert [record["action"] for record in records] == ["menu_open", "menu_release"]
+    assert "shutting down" in records[1]["result"]
 
 
 async def test_stop_file_halts_the_server(tmp_path):
@@ -275,7 +380,7 @@ async def test_agent_plays_a_scripted_session(tmp_path):
     betas = api.headers[0]["anthropic-beta"]
     assert "context-management-2025-06-27" in betas and "server-side-fallback-2026-07-01" in betas
     names = [tool["name"] for tool in first["tools"]]
-    assert names[-1] == "end_session" and names[:-1] == sorted(names[:-1]) and len(names) == 18
+    assert names[-1] == "end_session" and names[:-1] == sorted(names[:-1]) and len(names) == 21
     assert "Select unit 2" in first["messages"][0]["content"]
 
     # The history is append-only and the prefix (system, tools) never changes.

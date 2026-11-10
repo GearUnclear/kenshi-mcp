@@ -10,8 +10,11 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
+import signal
 import sys
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -47,12 +50,32 @@ class _Session:
     The platform handles underneath (X display, GDI contexts, the attached input
     queue) belong to the thread that made them, and input sequences must never
     interleave, so a single worker gives both guarantees.
+
+    One thing outlasts a call: the right button, held while Kenshi's action menu is open.
+    Between calls nothing is running that would notice an operator stop or a client that
+    never comes back, so a second thread asks the worker to check on it several times a
+    second (Controller.tend).
     """
 
     def __init__(self, config: Config, controller: Controller | None = None) -> None:
         self.config = config
         self._controller = controller
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kenshi-link")
+        self._closed = threading.Event()
+        self._tending: Future | None = None
+        threading.Thread(target=self._watch, name="kenshi-link-watch", daemon=True).start()
+
+    def _watch(self) -> None:
+        while not self._closed.wait(self.config.halt_poll_seconds):
+            controller = self._controller
+            if controller is None or not controller.menu_held:
+                continue
+            if self._tending is not None and not self._tending.done():
+                continue  # the worker is busy; whatever call it is running looks after the menu
+            try:
+                self._tending = self._pool.submit(controller.tend)
+            except RuntimeError:  # the pool has been shut down
+                return
 
     def _get(self) -> Controller:
         if self._controller is None:
@@ -98,6 +121,7 @@ class _Session:
         to exit. MCP clients give a server about two seconds before killing it, and a key
         still held down at that point stays down for the whole desktop.
         """
+        self._closed.set()
         controller = self._controller
         if controller is not None:
             controller.shutdown()
@@ -173,10 +197,11 @@ def build_server(
         """Click in the game.
 
         Left-click selects characters and presses buttons. Right-click gives the selected
-        characters their default order for whatever is under the pointer (move, attack,
-        talk, loot, use). A right-click with hold_seconds=0.7 opens Kenshi's menu of all
-        actions for that target. Shift+right-click on a job adds it as a standing job.
-        Returns a screenshot with a magenta ring where the click landed.
+        characters their default order for whatever is under the pointer: move to open
+        ground, attack an enemy, talk, loot a body, use a machine or bed. Shift+right-click
+        on work adds it as a standing job. For the menu of every action on a target use
+        menu_open, not this: that menu closes when the button is released. Returns a
+        screenshot with a magenta ring where the click landed.
         """
         return await session.run("click", x, y, button, modifiers, count, hold_seconds)
 
@@ -209,6 +234,47 @@ def build_server(
         camera in and down zooms out (the camera tool does the same from the centre).
         """
         return await session.run("scroll", x, y, direction, amount)
+
+    @tool()
+    async def menu_open(
+        x: Annotated[float, Field(description="X of the target, in screenshot pixels.")],
+        y: Annotated[float, Field(description="Y of the target, in screenshot pixels.")],
+    ) -> list:
+        """Hold the right mouse button on a target to open Kenshi's menu of every action on it.
+
+        Kenshi shows that menu only while the button is held, and an entry is chosen by
+        letting go over it. So this presses the button, waits for the menu, takes the
+        screenshot and returns with THE BUTTON STILL DOWN. Read the rows (zoom and observe
+        keep it down), then call menu_choose with a point on the row you want, or
+        menu_cancel. It works on characters, bodies, squad portraits, buildings, doors, beds
+        and containers; open ground has no menu. Entries act at once: Loot, Steal or Pick
+        Lock chosen here have none of the Alt safeguard that a plain right-click has. The
+        button is released without choosing if you call any other tool that touches the
+        game, if the operator stops the session, or when the time limit in the result passes.
+        """
+        return await session.run("menu_open", x, y)
+
+    @tool()
+    async def menu_choose(
+        x: Annotated[float, Field(description="X of a point on the row, in screenshot pixels.")],
+        y: Annotated[float, Field(description="Y of a point on the row, in screenshot pixels.")],
+    ) -> list:
+        """Finish a menu_open: move to a row of the action menu and release the right button there.
+
+        Releasing over a row gives that order. Aim well inside the row, using the
+        coordinates of the menu_open screenshot. A release anywhere that is not a row
+        closes the menu without an order.
+        """
+        return await session.run("menu_choose", x, y)
+
+    @tool()
+    async def menu_cancel() -> list:
+        """Finish a menu_open without choosing: release the right button where it was pressed.
+
+        With the menu open that spot is its title, which gives no order. If no menu had
+        opened, the release is an ordinary right-click there.
+        """
+        return await session.run("menu_cancel")
 
     # ---- keyboard ---------------------------------------------------------------
 
@@ -438,11 +504,37 @@ def build_server(
     return server
 
 
+def _clean_up_on_terminate(session: _Session) -> None:
+    """Let go of the game before dying when the process is asked to terminate.
+
+    By default the signal ends the process on the spot, and a mouse button or key held
+    down at that moment stays down for the whole desktop. (On Windows a process is ended
+    without any signal it could act on; there the client closing our stdin is the notice,
+    which main() already acts on.)
+    """
+
+    def leave(number: int, _frame: object) -> None:
+        # On a thread of its own, and not waited for long: this handler has interrupted the
+        # main thread at an arbitrary point, possibly one where it holds a lock that
+        # closing needs.
+        closing = threading.Thread(target=session.close, daemon=True)
+        closing.start()
+        closing.join(3)
+        signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)  # ... and end the way the sender meant
+
+    try:
+        signal.signal(signal.SIGTERM, leave)
+    except (ValueError, OSError, AttributeError):  # not the main thread, or no such signal here
+        pass
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="kenshi-link: %(message)s")
     config = load_config()
     session = _Session(config)
     server = build_server(config, session=session)
+    _clean_up_on_terminate(session)
     try:
         server.run()
     finally:

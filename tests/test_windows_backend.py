@@ -209,6 +209,48 @@ def test_a_click_where_another_window_covers_the_game_is_not_sent(game, window_l
         stop_window(overlay)
 
 
+def right_button(seen: list[dict]) -> list[tuple]:
+    return [(e["down"], e["x"], e["y"]) for e in seen if e["type"] == "button" and e["button"] == "right"]
+
+
+def test_the_right_button_stays_down_from_menu_open_until_a_row_is_chosen(game, window_log):
+    opened = game.menu_open(300, 250)
+    seen = wait_for(window_log, lambda seen: any(e["type"] == "button" for e in seen))
+    assert right_button(seen) == [(True, 300, 250)] and game.menu_held
+    assert "IT IS STILL DOWN" in opened.text
+    game.zoom(250, 200, 450, 400)  # looking leaves it down
+    time.sleep(0.3)
+    assert right_button(events(window_log)) == [(True, 300, 250)]
+    game.menu_choose(340, 320)
+    seen = wait_for(window_log, lambda seen: len(right_button(seen)) == 2)
+    assert right_button(seen) == [(True, 300, 250), (False, 340, 320)] and not game.menu_held
+    assert [e for e in seen if e["type"] == "motion" and e["right_down"]], "it moved to the row with the button down"
+
+
+def test_a_held_menu_is_let_go_by_another_action_by_the_time_limit_and_by_closing(config, window_log):
+    config.menu_timeout_seconds = 1
+    game = Controller(config)
+    try:
+        game.menu_open(300, 250)
+        pressed = game.press_key("i")
+        seen = wait_for(window_log, lambda seen: any(e["type"] == "key" for e in seen))
+        assert "closed without a choice" in pressed.text
+        order = [(e["type"], e["down"]) for e in seen if e["type"] in ("button", "key")]
+        assert order[:3] == [("button", True), ("button", False), ("key", True)], "up before the key went down"
+
+        game.menu_open(400, 300)
+        time.sleep(1.2)
+        game.tend()  # what the server does while no call is in progress
+        seen = wait_for(window_log, lambda seen: len(right_button(seen)) == 4)
+        assert right_button(seen)[-2:] == [(True, 400, 300), (False, 400, 300)] and not game.menu_held
+
+        game.menu_open(500, 400)
+    finally:
+        game.close()  # as at shutdown
+    seen = wait_for(window_log, lambda seen: len(right_button(seen)) == 6)
+    assert right_button(seen)[-2:] == [(True, 500, 400), (False, 500, 400)]
+
+
 def test_a_click_on_the_edge_of_the_window_does_not_leave_the_pointer_there(game, window_log):
     game.click(400, 599)
     seen = wait_for(window_log, lambda seen: any(e["type"] == "button" and not e["down"] for e in seen))

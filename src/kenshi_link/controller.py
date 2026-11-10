@@ -16,10 +16,16 @@ area loading), which no key press of ours explains. Two rules keep a wrong belie
 doing harm: the keys pressed never depend on it in a way that could invert (a speed key
 sets a speed outright, and the pause key, which toggles, is only pressed straight after
 one), and whenever the picture contradicts the belief the result says so.
+
+One thing is held across calls: the right mouse button, while Kenshi's action menu is
+open (menu_open). Everything that could leave it stuck lets go of it: any failed call,
+any other call that sends input, an operator stop, lost focus, a time limit (tend) and
+shutdown.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import locale
 import math
@@ -71,6 +77,10 @@ _EDGE_MARGIN = _CORNER_ZONE + 2
 # over the HUD too and while paused. A click there is allowed, but the pointer is not left
 # there: it is parked this share of the window in from the edge, half as much again.
 _SCROLL_ZONE = 0.015
+# Kenshi opens its action menu once the right button has been held 0.2 s on a target
+# (0.25 s on a portrait). A held right click of this length or more has opened it.
+_MENU_OPENS_AFTER = 0.2
+_MENU_DROPPED = "The action menu that was being held was closed without a choice."
 
 
 class ControlError(Exception):
@@ -103,6 +113,46 @@ class Result:
     images: list[Shot] = field(default_factory=list)
 
 
+@dataclass
+class _HeldMenu:
+    """The right button is down on a target, with Kenshi's action menu (if any) showing."""
+
+    x: float  # where it was pressed, in screenshot pixels
+    y: float
+    point: tuple[int, int]  # the same place in window pixels
+    since: float  # clock time of the press
+
+
+def _action(method=None, *, keeps_menu: bool = False):
+    """Mark a method as one of the things Claude can do, and make it safe around a held menu.
+
+    A held action menu is closed before anything else is sent, unless the action is part
+    of using it (`keeps_menu`). And whatever goes wrong, nothing stays held afterwards.
+    """
+
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapper(self, *args, **kwargs):
+            try:
+                if not keeps_menu:
+                    self._close_menu("the button was released first, because another action was asked for")
+                return function(self, *args, **kwargs)
+            except ControlError as exc:
+                note = _MENU_DROPPED if self._menu is not None else self._menu_ended
+                self._release_all()
+                self._menu_ended = ""
+                if note:
+                    raise type(exc)(f"{exc} {note}") from exc
+                raise
+            except BaseException:
+                self._release_all()
+                raise
+
+        return wrapper
+
+    return decorate(method) if method is not None else decorate
+
+
 class Controller:
     def __init__(
         self, config: Config, backend: Backend | None = None, clock: Clock | None = None
@@ -116,6 +166,8 @@ class Controller:
         self.actions = 0
         self._pointer: tuple[int, int] | None = None  # last pointer target, window pixels
         self._held: list[tuple[str, str]] = []
+        self._menu: _HeldMenu | None = None  # the right button, held across calls (see menu_open)
+        self._menu_ended = ""  # why the last held menu was closed without a choice, until reported
         self._session = time.strftime("%Y%m%d-%H%M%S")
         self._frame_number = 0
         # Set from other threads (see request_pause and shutdown); read on the one that acts.
@@ -382,6 +434,7 @@ class Controller:
             except Exception:
                 pass
         self._held.clear()
+        self._menu = None
 
     def _wheel(self, clicks: int) -> None:
         self._require_pointer_on_game()
@@ -485,8 +538,11 @@ class Controller:
         if self._closing.is_set():
             raise Interrupted("kenshi-link is shutting down; nothing was sent.")
         self._check_halt()
+        if self._menu is not None:
+            self._review_menu()
         info = self._window()
-        self._leave_edge(info)  # wherever it was left, by us or by the operator
+        if self._menu is None:
+            self._leave_edge(info)  # wherever it was left, by us or by the operator
         self.actions += 1
         return info
 
@@ -553,6 +609,8 @@ class Controller:
         parts = [state, f"screenshot {fit.width}x{fit.height}"]
         if motion is not None:
             parts.append(f"picture changing {motion:.2%}")
+        if self._menu is not None:
+            parts.append("RIGHT BUTTON HELD for the action menu")
         return "[" + " · ".join(parts) + "]"
 
     def _resume(self, speed: str) -> None:
@@ -599,6 +657,8 @@ class Controller:
         self, action: str, arguments: dict, lines: list[str], info: WindowInfo, images: list[Shot],
         motion: float | None = None,
     ) -> Result:
+        if self._menu_ended:
+            lines, self._menu_ended = [self._menu_ended, *lines], ""
         text = "\n".join([*lines, self._state_line(info, motion)])
         self._log(action, arguments, text)
         return Result(text, images)
@@ -614,7 +674,7 @@ class Controller:
         left out where the action itself moves the view.
         """
         info = self._window()
-        if self._leave_edge(info):
+        if self._menu is None and self._leave_edge(info):
             lines.append(
                 "The pointer was then moved in from the edge of the window, where it would have "
                 "kept scrolling the camera."
@@ -629,6 +689,7 @@ class Controller:
 
     # ---- looking ----------------------------------------------------------------
 
+    @_action(keeps_menu=True)
     def observe(self, grid: bool = False) -> Result:
         info = self._begin()
         frame, motion = self._probe(info)
@@ -640,10 +701,14 @@ class Controller:
         if grid:
             lines.append("A yellow coordinate grid is drawn on top; it is not part of the game.")
         lines += self._reconcile(motion)
+        if self._menu is not None:
+            lines.append(self._menu_reminder())
         return self._finish(
-            "observe", {"grid": grid}, lines, info, [self._shot(info, frame, grid=grid)], motion
+            "observe", {"grid": grid}, lines, info, [self._shot(info, frame, grid=grid, mark=self._menu is not None)],
+            motion,
         )
 
+    @_action(keeps_menu=True)
     def zoom(self, x0: float, y0: float, x1: float, y1: float) -> Result:
         info = self._begin()
         fit = self._fit(info)
@@ -677,6 +742,7 @@ class Controller:
 
     # ---- pointer ----------------------------------------------------------------
 
+    @_action
     def click(
         self, x: float, y: float, button: str = "left", modifiers: str = "", count: int = 1,
         hold_seconds: float = 0.0,
@@ -708,11 +774,17 @@ class Controller:
         prefix = f"{'+'.join(mods)}+" if mods else ""
         action = f"{prefix}{button} {kind}click".capitalize()
         lines = [f"{action} at ({x:g}, {y:g}){held}. The magenta ring marks where it landed."]
+        if button == "right" and hold_seconds >= _MENU_OPENS_AFTER:
+            lines.append(
+                "A right button held that long opens Kenshi's action menu, which closed again when the "
+                "button was released here. To see the menu and choose from it, use menu_open."
+            )
         lines += self._steal_warning(mods)
         arguments = {"x": x, "y": y, "button": button, "modifiers": modifiers, "count": count,
                      "hold_seconds": hold_seconds}
         return self._after_input("click", arguments, lines, mark=True)
 
+    @_action
     def drag(
         self, x0: float, y0: float, x1: float, y1: float, button: str = "left", modifiers: str = ""
     ) -> Result:
@@ -739,6 +811,7 @@ class Controller:
         arguments = {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "button": button, "modifiers": modifiers}
         return self._after_input("drag", arguments, lines, mark=True)
 
+    @_action
     def scroll(self, x: float, y: float, direction: str, amount: int = 3) -> Result:
         if direction not in ("up", "down"):
             raise ControlError("direction must be 'up' or 'down'.")
@@ -770,6 +843,179 @@ class Controller:
             "someone else, this was theft or lock-picking, a crime if anyone saw it."
         ]
 
+    # ---- the action menu ---------------------------------------------------------
+    #
+    # Kenshi's menu of every action on a target opens while the right button is held on it
+    # and exists only for as long as the button stays down; an entry is chosen by letting go
+    # over it. So the button has to stay down from one call (menu_open, which returns the
+    # screenshot that shows the list) to the next (menu_choose or menu_cancel).
+
+    @property
+    def menu_held(self) -> bool:
+        """Whether the right button is being held for the action menu. Safe to read from any thread."""
+        return self._menu is not None
+
+    def _menu_reminder(self) -> str:
+        left = max(0.0, self.config.menu_timeout_seconds - (self.clock.now() - self._menu.since))
+        return (
+            f"The right button is still held at ({self._menu.x:g}, {self._menu.y:g}), where the ring is. "
+            "Call menu_choose(x, y) with a point on the row you want, or menu_cancel(). observe and "
+            "zoom keep it held; anything else that touches the game, an operator stop, or another "
+            f"{left:.0f}s without a choice releases it without choosing."
+        )
+
+    def _close_menu(self, why: str) -> None:
+        """Let go of the held right button where it is, and remember why for the next result."""
+        if self._menu is None:
+            return
+        try:
+            self.backend.button("right", False)
+        except Exception:
+            pass
+        if ("button", "right") in self._held:
+            self._held.remove(("button", "right"))
+        self._menu = None
+        self._menu_ended = f"The action menu was closed without a choice: {why}."
+        self._log("menu_release", {}, self._menu_ended)
+
+    def _menu_lapsed(self) -> str | None:
+        """Why a held menu has to be let go now, if it has."""
+        if self._closing.is_set():
+            return "kenshi-link is shutting down"
+        limit = self.config.menu_timeout_seconds
+        if self.clock.now() - self._menu.since >= limit:
+            return f"the button had been held for {limit:g}s"
+        try:
+            focused = self.backend.locate().focused
+        except BackendError:
+            focused = False
+        return None if focused else "Kenshi lost focus"
+
+    def _review_menu(self) -> None:
+        why = self._menu_lapsed()
+        if why:
+            self._close_menu(why)
+
+    def tend(self) -> None:
+        """Look after a held menu between calls: let go of it if the operator has stopped
+        the session, the game has lost focus, the time limit has passed or the program is
+        shutting down.
+
+        Nothing else notices these while no call is in progress. Whoever owns this controller
+        calls it regularly, on the thread that makes the other calls.
+        """
+        if self._menu is None:
+            return
+        try:
+            self._check_halt()
+        except Halted:
+            stopped = self.config.stop_file.exists()
+            self._close_menu("the operator stopped the session" if stopped else "the desktop is out of reach")
+            return
+        except ControlError:
+            pass  # the stop checks are failing; the time limit still applies
+        try:
+            self._review_menu()
+        except Exception:
+            self._release_all()
+
+    @_action
+    def menu_open(self, x: float, y: float) -> Result:
+        info = self._begin()
+        wx, wy = self._window_point(info, x, y)
+        # A pointer resting on the window's edge scrolls the camera, and this one rests until
+        # a choice is made: keep the press clear of it.
+        target = self._off_the_edge(info, wx, wy)
+        hold = self.config.menu_hold_seconds
+        arguments = {"x": x, "y": y}
+
+        def run() -> Result:
+            self._glide(info, *target)
+            before = self._grab(info)
+            self._button_down("right")
+            self._menu = _HeldMenu(x, y, target, self.clock.now())
+            self._hold(hold)
+            self.clock.sleep(self.config.settle_seconds)
+            self._require_focus("holding the right button")
+            frame = self._grab(info)
+            lines = [
+                f"Pressed the right button at ({x:g}, {y:g}) and held it for {hold:g}s. IT IS STILL DOWN. "
+                "This screenshot was taken with it held, and the magenta ring marks the pointer."
+            ]
+            if target != (wx, wy):
+                lines.append(
+                    "The press was moved a little way in from the edge of the window, because a pointer "
+                    "resting on the edge scrolls the camera."
+                )
+            if self._moving(imaging.motion_fraction(before, frame)) or (self.paused is False):
+                lines.append(
+                    "Kenshi's action menu lists the target's name, then one row per action, with its "
+                    "top-left corner at the pointer unless the screen's edge pushed it aside. If no "
+                    "list is showing, nothing here has a menu: letting go then acts as an ordinary "
+                    "right-click on this spot."
+                )
+            else:
+                lines.append(
+                    "NOTHING CHANGED ON SCREEN when the button went down, so no menu seems to have "
+                    "opened: open ground has none, and a target that has one may need the game clock "
+                    "running. Letting go now acts as an ordinary right-click on this spot (on open "
+                    "ground, a move order)."
+                )
+            lines.append(self._menu_reminder())
+            return self._finish("menu_open", arguments, lines, info, [self._shot(info, frame, mark=True)])
+
+        return self._input(run)
+
+    @_action(keeps_menu=True)
+    def menu_choose(self, x: float, y: float) -> Result:
+        info = self._begin()  # a stop is reported as a stop; a hold that has lapsed is let go
+        if self._menu is None:
+            why, self._menu_ended = self._menu_ended, ""
+            raise ControlError(
+                f"No action menu is being held, so nothing was chosen. {why + ' ' if why else ''}"
+                "Call menu_open on the target first."
+            )
+        wx, wy = self._window_point(info, x, y)
+
+        def run() -> None:
+            self._glide(info, wx, wy, seconds=self.config.drag_seconds)
+            self._require_pointer_on_game()
+            self.clock.sleep(0.08)
+            self._button_up("right")
+            self._menu = None
+
+        self._input(run)
+        lines = [
+            f"Moved to ({x:g}, {y:g}) with the right button held and released it there; the magenta "
+            "ring marks the spot. If that was a row of the action menu, its order has been given: "
+            "check what the character is now doing."
+        ]
+        return self._after_input("menu_choose", {"x": x, "y": y}, lines, mark=True)
+
+    @_action(keeps_menu=True)
+    def menu_cancel(self) -> Result:
+        info = self._begin() if self._menu is not None else None
+        if self._menu is None:  # never held, or let go already (the reason is then on record)
+            why, self._menu_ended = self._menu_ended, ""
+            text = why or "No action menu was being held; nothing was sent."
+            self._log("menu_cancel", {}, text)
+            return Result(text)
+        pressed = self._menu.point
+
+        def run() -> None:
+            if self.backend.cursor() != (info.left + pressed[0], info.top + pressed[1]):
+                self._glide(info, *pressed)  # something moved it: back to where the menu's title is
+            self._button_up("right")
+            self._menu = None
+
+        self._input(run)
+        lines = [
+            "Released the right button where it was pressed. With the action menu open that is its "
+            "title, which chooses nothing. If no menu had opened, or the screen's edge had pushed "
+            "the list under the pointer, this was a right-click on what lies there: check the screenshot."
+        ]
+        return self._after_input("menu_cancel", {}, lines, mark=True)
+
     # ---- keyboard ---------------------------------------------------------------
 
     def _modifiers(self, modifiers: str) -> list[str]:
@@ -795,6 +1041,7 @@ class Controller:
         other_mods, other_key = parse_combo(self.config.keymap[action])
         return key == other_key and set(mods) == set(other_mods)
 
+    @_action
     def press_key(self, key: str, repeat: int = 1, hold_seconds: float = 0.0) -> Result:
         if not 1 <= repeat <= 20:
             raise ControlError("repeat must be between 1 and 20.")
@@ -841,6 +1088,7 @@ class Controller:
             "again) before set_speed or advance."
         ]
 
+    @_action
     def type_text(self, text: str) -> Result:
         if not text:
             raise ControlError("text is empty.")
@@ -878,6 +1126,7 @@ class Controller:
             )
         return self._after_input("type_text", {"text": text}, lines)
 
+    @_action
     def hotkey(self, action: str, repeat: int = 1, in_game: bool = False) -> Result:
         keymap = self.config.keymap
         usable = sorted(a for a in keymap if a not in _TIME_ACTIONS and not a.startswith("camera_"))
@@ -945,6 +1194,7 @@ class Controller:
 
     # ---- camera -----------------------------------------------------------------
 
+    @_action
     def camera(self, action: str, steps: int = 2) -> Result:
         if action not in CAMERA_ACTIONS:
             raise ControlError(f"action must be one of: {', '.join(CAMERA_ACTIONS)}.")
@@ -979,6 +1229,7 @@ class Controller:
 
     # ---- time -------------------------------------------------------------------
 
+    @_action
     def set_speed(self, speed: str) -> Result:
         if speed not in SPEEDS:
             raise ControlError(f"speed must be one of: {', '.join(SPEEDS)}.")
@@ -1022,6 +1273,7 @@ class Controller:
         lines += self._confirm_pause(motion) if pressed else self._reconcile(motion)
         return self._finish("set_speed", {"speed": speed}, lines, info, [self._shot(info, frame)], motion)
 
+    @_action
     def advance(self, seconds: float, speed: str = "normal", frames: int = 2) -> Result:
         if speed not in SPEEDS[1:]:
             raise ControlError(f"speed must be one of: {', '.join(SPEEDS[1:])}.")
@@ -1176,6 +1428,7 @@ class Controller:
         self._release_all()
 
     def close(self) -> None:
+        self._close_menu("kenshi-link is shutting down")
         self._release_all()
         self.backend.close()
 

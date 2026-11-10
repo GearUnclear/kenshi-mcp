@@ -297,7 +297,7 @@ def test_the_example_config_names_real_settings_and_shows_their_defaults(tmp_pat
     config, defaults = load_config(path, env={}), Config()
     shown = set(re.findall(r"(?m)^(\w+) = ", text.split("[keymap]")[0]))
     assert {"pointer_dwell_seconds", "modifier_gap_seconds", "click_hold_seconds", "key_hold_seconds",
-            "halt_poll_seconds", "allow_shift_tab"} <= shown
+            "halt_poll_seconds", "allow_shift_tab", "menu_hold_seconds", "menu_timeout_seconds"} <= shown
     for name in shown:
         assert getattr(config, name) == getattr(defaults, name), name
     assert config.keymap == DEFAULT_KEYMAP
@@ -321,6 +321,20 @@ def test_new_timing_and_safety_settings_have_defaults_and_can_be_set(tmp_path):
     for bad in ({"halt_poll_seconds": 0}, {"halt_poll_seconds": 5}, {"modifier_gap_seconds": -1},
                 {"pointer_dwell_seconds": -0.1}):
         with pytest.raises(ValueError):
+            Config(**bad).validate()
+
+
+def test_the_action_menu_settings_have_defaults_and_limits(tmp_path):
+    defaults = Config()
+    assert (defaults.menu_hold_seconds, defaults.menu_timeout_seconds) == (0.5, 30.0)
+    path = tmp_path / "config.toml"
+    path.write_text("menu_hold_seconds = 0.8\n")
+    config = load_config(path, env={"KENSHI_LINK_MENU_TIMEOUT_SECONDS": "45"})
+    assert (config.menu_hold_seconds, config.menu_timeout_seconds) == (0.8, 45.0)
+    # Kenshi opens the menu after 0.2 s (0.25 s on a portrait): a shorter hold would show nothing.
+    for bad in ({"menu_hold_seconds": 0.2}, {"menu_hold_seconds": 60}, {"menu_timeout_seconds": 0},
+                {"menu_timeout_seconds": 3600}):
+        with pytest.raises(ValueError, match="menu_"):
             Config(**bad).validate()
 
 

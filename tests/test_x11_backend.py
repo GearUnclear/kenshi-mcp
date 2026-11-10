@@ -140,6 +140,39 @@ def test_scroll_and_drag(game, window_log):
     assert dragged, "pointer motion was seen while the left button was down"
 
 
+def _right_button(events: list[dict]) -> list[tuple]:
+    return [(e["down"], e["x"], e["y"]) for e in events if e["type"] == "button" and e["button"] == 3]
+
+
+def test_the_right_button_stays_down_from_menu_open_until_a_row_is_chosen(game, window_log):
+    opened = game.menu_open(300, 250)
+    events = _wait_for(window_log, lambda ev: any(e["type"] == "button" for e in ev))
+    assert _right_button(events) == [(True, 300, 250)] and game.menu_held
+    assert "IT IS STILL DOWN" in opened.text
+    game.zoom(250, 200, 450, 400)  # looking leaves it down
+    time.sleep(0.3)
+    assert _right_button(_events(window_log)) == [(True, 300, 250)]
+    game.menu_choose(340, 320)
+    events = _wait_for(window_log, lambda ev: len(_right_button(ev)) == 2)
+    assert _right_button(events) == [(True, 300, 250), (False, 340, 320)] and not game.menu_held
+    dragged = [e for e in events if e["type"] == "motion" and e["state"] & 0x400]
+    assert dragged, "the pointer moved to the row with the right button down"
+
+
+def test_a_held_menu_is_let_go_by_another_action_and_by_closing(game, window_log, tmp_path):
+    game.menu_open(300, 250)
+    pressed = game.press_key("i")
+    events = _wait_for(window_log, lambda ev: any(e["type"] == "key" for e in ev))
+    assert "closed without a choice" in pressed.text
+    released = [e for e in events if e["type"] in ("button", "key")]
+    assert (released[1]["type"], released[1]["down"]) == ("button", False), "the button came up before the key went down"
+    leaving = Controller(Config(backend="x11", data_dir=tmp_path / "home2", settle_seconds=0.1))
+    leaving.menu_open(500, 400)
+    leaving.close()  # as at shutdown
+    events = _wait_for(window_log, lambda ev: len(_right_button(ev)) == 4)
+    assert _right_button(events)[-2:] == [(True, 500, 400), (False, 500, 400)]
+
+
 def test_a_click_on_the_edge_of_the_window_does_not_leave_the_pointer_there(game, window_log):
     game.click(400, 599)
     events = _wait_for(window_log, lambda ev: sum(e["type"] == "button" and not e["down"] for e in ev) >= 1)

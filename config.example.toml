@@ -41,6 +41,12 @@
 # Longest single advance() Claude may ask for, in real seconds.
 # max_advance_seconds = 120.0
 
+# Kenshi's action menu shows only while the right mouse button is held on a target, so
+# menu_open keeps the button down until Claude has chosen an entry.
+# menu_hold_seconds = 0.5        # how long the button is down before the screenshot is taken
+#                                # (the game opens the menu after 0.2 s; raise it if no menu shows)
+# menu_timeout_seconds = 30.0    # the button is released by itself if no choice is made in this time
+
 # Safety
 # auto_focus = true           # bring Kenshi to the front when it has lost focus
 # failsafe_corner = true      # mouse in the top-left corner of the screen stops everything

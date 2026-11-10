@@ -35,7 +35,7 @@ BUTTON_MESSAGES = {
     0x0204: ("right", True), 0x0205: ("right", False),
     0x0207: ("middle", True), 0x0208: ("middle", False),
 }
-MK_LBUTTON, MK_SHIFT = 0x0001, 0x0004
+MK_LBUTTON, MK_RBUTTON, MK_SHIFT = 0x0001, 0x0002, 0x0004
 WIDTH, HEIGHT, LEFT, TOP = 800, 600, 100, 50
 
 
@@ -149,7 +149,7 @@ def main() -> None:
             return 0
         if message == WM_MOUSEMOVE:
             record(type="motion", x=_signed16(lparam), y=_signed16(lparam >> 16),
-                   left_down=bool(wparam & MK_LBUTTON))
+                   left_down=bool(wparam & MK_LBUTTON), right_down=bool(wparam & MK_RBUTTON))
             return 0
         if message == WM_MOUSEWHEEL:
             record(type="wheel", delta=_signed16(wparam >> 16))

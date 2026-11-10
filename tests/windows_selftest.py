@@ -150,6 +150,33 @@ def main() -> int:
         check("drag ends at (500, 400)", (left[-1]["x"], left[-1]["y"], left[-1]["down"]) == (500, 400, False), left[-1])
         check("motion seen with the button down", any(e["type"] == "motion" and e["left_down"] for e in seen))
 
+        # Kenshi's action menu shows only while the right button is held, so the button
+        # has to stay down from one call to the next and come up where the next call says.
+        before = len(events(log))
+        game.menu_open(300, 250)
+        seen = wait_for(log, lambda ev: any(e["type"] == "button" for e in ev[before:]), "a held right button")[before:]
+        held = [(e["button"], e["down"], e["x"], e["y"]) for e in seen if e["type"] == "button"]
+        check("menu_open presses the right button and leaves it down", held == [("right", True, 300, 250)], held)
+        game.zoom(250, 200, 450, 400)
+        time.sleep(0.3)
+        check("it is still down after looking",
+              not [e for e in events(log)[before:] if e["type"] == "button" and not e["down"]])
+        game.menu_choose(340, 320)
+        seen = wait_for(log, lambda ev: any(e["type"] == "button" and not e["down"] for e in ev[before:]),
+                        "the release")[before:]
+        ups = [(e["button"], e["x"], e["y"]) for e in seen if e["type"] == "button" and not e["down"]]
+        check("menu_choose releases it over the chosen spot", ups == [("right", 340, 320)], ups)
+        check("motion seen with the right button down",
+              any(e["type"] == "motion" and e["right_down"] for e in seen))
+        before = len(events(log))
+        game.menu_open(300, 250)
+        game.press_key("i")
+        seen = wait_for(log, lambda ev: any(e["type"] == "key" and not e["down"] for e in ev[before:]),
+                        "a key after a held menu")[before:]
+        order = [(e["type"], e["down"]) for e in seen if e["type"] in ("button", "key")]
+        check("another action releases a held menu first",
+              order[:3] == [("button", True), ("button", False), ("key", True)], order)
+
         before = len(events(log))
         game.click(400, 599)
         seen = wait_for(log, lambda ev: any(e["type"] == "button" and not e["down"] for e in ev[before:]),

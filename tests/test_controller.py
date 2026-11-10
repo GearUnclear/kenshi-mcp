@@ -111,9 +111,12 @@ def test_right_click_orders_and_advance_moves_the_unit(controller, backend):
     assert (backend.units[1].x, backend.units[1].y) != before
 
 
-def test_right_click_hold_opens_the_context_menu(controller, backend):
-    controller.click(300, 300, button="right", hold_seconds=0.7)
-    assert backend.menu is not None
+def test_a_held_right_click_opens_the_action_menu_and_closes_it_again(controller, backend):
+    result = controller.click(*UNIT_2, button="right", hold_seconds=0.7)
+    assert "menu opened at (860, 530)" in backend.log, "holding the button on a unit opens its menu"
+    assert backend.menu is None and backend.chosen == [], "... which is gone again once the button is up"
+    assert "use menu_open" in result.text
+    assert "menu_open" not in controller.click(*UNIT_2, button="right").text
 
 
 def test_drag_box_selects(controller, backend):
@@ -900,6 +903,286 @@ def test_caps_lock_stops_letters_being_typed_in_the_wrong_case(controller, backe
     assert backend.events == []
     controller.type_text("12 34")  # Caps Lock does not change these
     assert backend.typed == "1234"
+
+
+# ---- the action menu: a button held from one call to the next --------------------------
+#
+# The stand-in's menu behaves as Kenshi's does: it opens once the right button has rested
+# on a unit, with its top-left corner at the pointer, and exists only while the button is
+# down. Unit 2's menu has its title at window (860, 530) and its two rows below it.
+
+ROW_1, ROW_2 = (720, 455), (720, 479)  # screenshot pixels, well inside each row
+
+
+def right_button(backend) -> list[tuple]:
+    return [e[2:] for e in backend.events if e[0] == "button" and e[1] == "right"]
+
+
+def test_menu_open_shows_the_menu_in_a_screenshot_taken_with_the_button_still_down(controller, backend, monkeypatch):
+    seen, capture = [], backend.capture
+
+    def looking(*args):
+        frame = capture(*args)  # the stand-in opens its menu when it next looks at the clock
+        seen.append(("right" in backend._held_buttons, backend.menu))
+        return frame
+
+    monkeypatch.setattr(backend, "capture", looking)
+    before = image_of(controller.observe())
+    result = controller.menu_open(*UNIT_2)
+    assert seen[-1] == (True, (860, 530)), "the last picture was taken with the button down and the menu open"
+    assert right_button(backend) == [(True, 980, 590)], "pressed on the unit and not released"
+    assert controller.menu_held and "right" in backend._held_buttons
+    assert "IT IS STILL DOWN" in result.text and "RIGHT BUTTON HELD" in result.text.splitlines()[-1]
+    assert "NOTHING CHANGED" not in result.text
+    # The list is in the picture Claude gets: dark panel where there was background.
+    spot = (688 + 60, 424 + 40)
+    assert sum(image_of(result).convert("RGB").getpixel(spot)) < sum(before.convert("RGB").getpixel(spot)) - 30
+
+
+def test_the_button_rests_long_enough_for_the_menu_before_the_screenshot(controller, config, backend):
+    controller.menu_open(*UNIT_2)
+    pressed = when(backend, "button", "right", True)
+    assert when(backend, "move", 980, 590) + config.pointer_dwell_seconds == pytest.approx(pressed)
+    assert backend.clock.now() - pressed >= config.menu_hold_seconds >= 0.3  # Kenshi needs 0.2 s, 0.25 on a portrait
+    assert not [e for e, t in zip(backend.events, backend.stamps) if e[0] == "move" and t > pressed]
+
+
+def test_menu_choose_releases_over_the_row_and_that_gives_the_order(controller, backend):
+    controller.menu_open(*UNIT_2)
+    result = controller.menu_choose(*ROW_2)
+    assert backend.chosen == [(2, 2)] and backend.menu is None
+    assert right_button(backend) == [(True, 980, 590), (False, 120 + 900, 60 + 599)]
+    assert not controller.menu_held and backend._held_buttons == {}
+    assert "released it there" in result.text and "RIGHT BUTTON" not in result.text
+    moved_while_held = [e for e, t in zip(backend.events, backend.stamps)
+                        if e[0] == "move" and t > when(backend, "button", "right", True)]
+    assert len(moved_while_held) > 1, "the pointer travels to the row with the button down"
+    backend.events.clear()
+    controller.menu_open(*UNIT_2)
+    controller.menu_choose(*ROW_1)
+    assert backend.chosen == [(2, 2), (2, 1)]
+
+
+def test_menu_cancel_lets_go_on_the_title_which_chooses_nothing(controller, backend):
+    controller.click(*UNIT_2)
+    controller.menu_open(*UNIT_2)
+    result = controller.menu_cancel()
+    assert right_button(backend) == [(True, 980, 590), (False, 980, 590)]
+    assert backend.chosen == [] and backend.menu is None and not controller.menu_held
+    assert backend.units[1].target is None, "no order of any kind was given"
+    assert "chooses nothing" in result.text
+    assert "No action menu was being held" in controller.menu_cancel().text  # again: nothing to do, no error
+
+
+def test_a_pointer_knocked_off_the_title_is_put_back_before_a_cancel(controller, backend):
+    controller.menu_open(*UNIT_2)
+    backend._pointer = (120 + 900, 60 + 599)  # the operator's hand: now over row 2
+    controller.menu_cancel()
+    assert right_button(backend)[-1] == (False, 980, 590) and backend.chosen == []
+
+
+def test_looking_keeps_the_menu_held(controller, backend):
+    controller.menu_open(*UNIT_2)
+    zoomed = controller.zoom(600, 380, 900, 560)
+    observed = controller.observe()
+    assert controller.menu_held and backend.menu is not None and right_button(backend) == [(True, 980, 590)]
+    assert "RIGHT BUTTON HELD" in zoomed.text and "still held at (688, 424)" in observed.text
+    controller.sync_pause(True)  # presses nothing, touches nothing
+    assert controller.menu_held
+    controller.menu_choose(*ROW_1)
+    assert backend.chosen == [(2, 1)]
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        lambda c: c.click(300, 300),
+        lambda c: c.drag(400, 200, 500, 300),
+        lambda c: c.scroll(640, 360, "up", 1),
+        lambda c: c.press_key("i"),
+        lambda c: c.type_text("a"),
+        lambda c: c.hotkey("inventory"),
+        lambda c: c.hotkey("highlight_items"),
+        lambda c: c.camera("left", 1),
+        lambda c: c.set_speed("pause"),
+        lambda c: c.set_speed("normal"),
+        lambda c: c.advance(1, "normal"),
+        lambda c: c.menu_open(300, 300),
+    ],
+    ids=["click", "drag", "scroll", "press_key", "type_text", "hotkey", "highlight", "camera", "pause",
+         "set_speed", "advance", "menu_open"],
+)
+def test_any_other_action_lets_go_of_the_menu_first(controller, backend, other):
+    controller.sync_pause(False)
+    controller.menu_open(*UNIT_2)
+    count = len(backend.events)
+    result = other(controller)
+    assert backend.events[count] == ("button", "right", False, 980, 590), "released before anything else was sent"
+    assert backend.chosen == [], "... where it was pressed, which is the title: nothing chosen"
+    assert result.text.startswith("The action menu was closed without a choice: the button was released first")
+    assert "right" not in backend._held_buttons or right_button(backend)[-1][0], "only a new menu_open holds it"
+
+
+def test_a_call_that_fails_lets_go_of_the_menu(controller, backend):
+    controller.menu_open(*UNIT_2)
+    with pytest.raises(ControlError, match="outside the 1280x720.*action menu.*closed without a choice"):
+        controller.menu_choose(5000, 10)
+    assert not controller.menu_held and backend._held_buttons == {} and backend.chosen == []
+    controller.menu_open(*UNIT_2)
+    with pytest.raises(ControlError, match="x0 < x1.*closed without a choice"):
+        controller.zoom(400, 0, 100, 100)  # even one that only looks
+    assert backend._held_buttons == {}
+    controller.menu_open(*UNIT_2)
+    with pytest.raises(ControlError, match="button must be.*closed without a choice"):
+        controller.click(10, 10, button="fourth")
+    assert backend._held_buttons == {}
+    with pytest.raises(ControlError, match="No action menu is being held"):
+        controller.menu_choose(*ROW_1)
+
+
+def test_a_backend_failure_while_choosing_still_lets_go(controller, backend, monkeypatch):
+    controller.menu_open(*UNIT_2)
+    move = backend.move
+
+    def broken(x, y):
+        raise BackendError("device lost")
+
+    monkeypatch.setattr(backend, "move", broken)
+    with pytest.raises(ControlError, match="device lost"):
+        controller.menu_choose(*ROW_2)
+    monkeypatch.setattr(backend, "move", move)
+    assert backend._held_buttons == {} and not controller.menu_held and backend.chosen == []
+
+
+def test_an_operator_stop_between_calls_lets_go_of_the_menu(controller, config, backend):
+    controller.menu_open(*UNIT_2)
+    controller.tend()  # what the server does several times a second while nothing else runs
+    assert controller.menu_held, "nothing has happened: it stays held"
+    backend.panic = True
+    controller.tend()
+    assert backend._held_buttons == {} and not controller.menu_held and config.stop_file.exists()
+    with pytest.raises(Halted, match="closed without a choice: the operator stopped the session"):
+        controller.menu_choose(*ROW_1)
+    assert backend.chosen == []
+
+
+@pytest.mark.parametrize("stop", ["stop file", "corner"])
+def test_the_other_ways_of_stopping_let_go_of_it_too(controller, config, backend, stop):
+    controller.menu_open(*UNIT_2)
+    if stop == "stop file":
+        config.stop_file.write_text("stop\n")
+    else:
+        backend._pointer = (1, 1)
+    controller.tend()
+    assert right_button(backend)[-1][0] is False and not controller.menu_held and backend.chosen == []
+    with pytest.raises(Halted):
+        controller.observe()
+
+
+def test_a_stop_while_the_button_is_first_held_ends_it_there(controller, backend, clock, monkeypatch):
+    start = clock.time
+    after(clock, monkeypatch, start + 0.4, lambda: setattr(backend, "panic", True))
+    with pytest.raises(Halted, match="Pause/Break"):
+        controller.menu_open(*UNIT_2)
+    assert backend._held_buttons == {} and not controller.menu_held
+
+
+def test_a_menu_nobody_comes_back_to_is_let_go_after_the_time_limit(controller, config, backend, clock):
+    controller.menu_open(*UNIT_2)
+    clock.sleep(config.menu_timeout_seconds - 2)
+    controller.tend()
+    assert controller.menu_held
+    clock.sleep(2)
+    controller.tend()
+    assert backend._held_buttons == {} and not controller.menu_held and backend.chosen == []
+    with pytest.raises(ControlError, match=r"No action menu is being held.*held for 30s.*menu_open"):
+        controller.menu_choose(*ROW_1)
+    assert "held for 30s" not in controller.observe().text, "the reason is given once"
+
+
+def test_the_time_limit_holds_even_if_nothing_was_tending(controller, config, backend, clock):
+    config.menu_timeout_seconds = 5
+    controller.menu_open(*UNIT_2)
+    assert "another 4s without a choice" in controller.observe().text
+    clock.sleep(6)
+    with pytest.raises(ControlError, match="held for 5s"):
+        controller.menu_choose(*ROW_1)
+    assert backend._held_buttons == {} and backend.chosen == []
+    controller.menu_open(*UNIT_2)
+    clock.sleep(6)
+    assert "closed without a choice: the button had been held for 5s" in controller.observe().text
+    assert backend._held_buttons == {}
+
+
+def test_losing_focus_lets_go_of_the_menu(controller, backend):
+    controller.menu_open(*UNIT_2)
+    backend.focused = False
+    controller.tend()
+    assert not controller.menu_held
+    assert right_button(backend)[-1][0] is False, "the release itself is sent whoever has focus"
+    backend.focused = True
+    assert "closed without a choice: Kenshi lost focus" in controller.observe().text
+
+
+def test_shutting_down_lets_go_of_the_menu(controller, config, backend):
+    controller.menu_open(*UNIT_2)
+    controller.shutdown()
+    controller.tend()
+    assert backend._held_buttons == {} and not controller.menu_held
+    log = next(config.sessions_dir.glob("*.jsonl")).read_text(encoding="utf-8")
+    assert '"action": "menu_release"' in log and "shutting down" in log
+
+
+def test_close_lets_go_of_the_menu(controller, backend):
+    controller.menu_open(*UNIT_2)
+    controller.close()
+    assert backend._held_buttons == {} and right_button(backend)[-1] == (False, 980, 590)
+
+
+def test_tending_never_raises_and_does_nothing_without_a_menu(controller, backend, monkeypatch):
+    controller.tend()
+    assert backend.events == []
+    controller.menu_open(*UNIT_2)
+
+    def broken():
+        raise BackendError("Windows would not report the pointer position (error 5).")
+
+    monkeypatch.setattr(backend, "cursor", broken)
+    monkeypatch.setattr(backend, "locate", broken)
+    controller.tend()  # the checks are failing: let go rather than hold on blind
+    assert backend._held_buttons == {} and not controller.menu_held
+
+
+def test_open_ground_has_no_menu_and_the_result_says_what_letting_go_will_do(controller, backend):
+    controller.click(*UNIT_2)
+    result = controller.menu_open(1000, 200)
+    assert backend.menu is None and controller.menu_held
+    assert "NOTHING CHANGED ON SCREEN" in result.text and "ordinary right-click" in result.text
+    controller.menu_cancel()
+    assert backend.units[1].target is not None, "which is what it did: a move order"
+
+
+def test_a_press_on_the_edge_of_the_window_is_moved_in_so_the_camera_stays_put(controller, backend, clock):
+    result = controller.menu_open(640, 719)
+    assert right_button(backend) == [(True, 120 + 800, 60 + 885)], "14 px in from the bottom: 1.5% of 900"
+    assert "moved a little way in from the edge" in result.text
+    camera = list(backend.camera)
+    clock.sleep(5)
+    controller.observe()
+    assert backend.camera == camera, "held there for seconds, the view did not scroll"
+
+
+def test_a_covered_spot_is_not_pressed_or_released_on(controller, backend):
+    backend.obstructed = True
+    with pytest.raises(ControlError, match="covering the game"):
+        controller.menu_open(*UNIT_2)
+    assert right_button(backend) == [] and not controller.menu_held
+    backend.obstructed = False
+    controller.menu_open(*UNIT_2)
+    backend.obstructed = True
+    with pytest.raises(ControlError, match="covering the game"):
+        controller.menu_choose(*ROW_1)
+    assert backend._held_buttons == {} and not controller.menu_held
 
 
 # ---- pause: a belief the game can overtake ---------------------------------------------

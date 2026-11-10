@@ -5,9 +5,10 @@ kinds of input the controller sends a real game: pause toggling, speed keys,
 click-to-select, right-click-to-move, camera keys and the wheel.
 
 Where Kenshi's handling of an input is what makes it awkward to automate, the stand-in
-copies it: speed keys that set a speed outright while the pause key toggles, pauses the
-game makes by itself (a conversation, the build window), a camera that scrolls while the
-pointer rests on the window's edge, and a title screen that Escape quits.
+copies it: an action menu that exists only while the right button is held, speed keys
+that set a speed outright while the pause key toggles, pauses the game makes by itself
+(a conversation, the build window), a camera that scrolls while the pointer rests on
+the window's edge, and a title screen that Escape quits.
 """
 
 from __future__ import annotations
@@ -27,7 +28,9 @@ _UNIT_SPEED = 40.0  # world units per game second
 _PAN_SPEED = 300.0  # world units per held second
 _EDGE_SPEED = 300.0  # world units per second while the pointer rests on the window's edge
 _EDGE_ZONE = 0.01  # the outer share of the window, each side, that scrolls the camera
-_MENU_HOLD = 0.4
+_MENU_HOLD = 0.2  # the right button must stay down this long on a unit before its menu opens
+_MENU_WIDTH, _MENU_TITLE, _MENU_ROW = 160, 24, 30
+_MENU_ROWS = ("Option 1", "Option 2")
 _SELECT_RADIUS = 26
 
 
@@ -58,7 +61,9 @@ class MockBackend(Backend):
         self.zoom = 1.0
         self.heading = 0.0
         self.units = [Unit(1, -120, -40), Unit(2, 60, 80), Unit(3, 200, -150)]
-        self.menu: tuple[int, int] | None = None
+        self.menu: tuple[int, int] | None = None  # top-left corner of the open action menu
+        self.menu_unit: int | None = None  # the unit it is for
+        self.chosen: list[tuple[int, int]] = []  # (unit, row) for every menu entry chosen
         self.resume_speed = 1.0  # what the pause key goes back to
         self.conversation = False  # a conversation window is open, which holds the game paused
         self._before_conversation: bool | None = None
@@ -104,6 +109,7 @@ class MockBackend(Backend):
         if "e" in self._held_keys:
             self.heading += 90 * elapsed
         self._edge_scroll(elapsed)
+        self._open_menu_if_held()
         if self.paused:
             return
         game_elapsed = elapsed * self.speed
@@ -131,6 +137,53 @@ class MockBackend(Backend):
                 self.camera[axis] -= _EDGE_SPEED * elapsed
             elif share > 1 - _EDGE_ZONE:
                 self.camera[axis] += _EDGE_SPEED * elapsed
+
+    def _unit_at(self, position: tuple[int, int]) -> Unit | None:
+        nearest, best = None, _SELECT_RADIUS
+        for unit in self.units:
+            ux, uy = self._to_window(unit.x, unit.y)
+            distance = math.hypot(ux - position[0], uy - position[1])
+            if distance <= best:
+                nearest, best = unit, distance
+        return nearest
+
+    def _open_menu_if_held(self) -> None:
+        """The action menu opens once the right button has rested on a unit long enough.
+
+        Its top-left corner goes where the pointer is, pushed back inside the window if
+        need be. Open ground has no menu, and neither does a press that moved off its unit
+        before the time was up.
+        """
+        pressed = self._held_buttons.get("right")
+        position = self._pointer_in_window()
+        if pressed is None or self.menu is not None or position is None or position != pressed[1]:
+            return
+        if self.clock.now() - pressed[0] < _MENU_HOLD:
+            return
+        unit = self._unit_at(position)
+        if unit is None:
+            return
+        height = _MENU_TITLE + _MENU_ROW * len(_MENU_ROWS)
+        self.menu = (min(position[0], self.width - _MENU_WIDTH - 1), min(position[1], self.height - height - 1))
+        self.menu_unit = unit.number
+        self._note(f"menu opened at {position}")
+
+    def _menu_row(self, position: tuple[int, int]) -> int | None:
+        """Which row of the open menu a point is on, counting from 1; None for the title or outside."""
+        if self.menu is None:
+            return None
+        dx, dy = position[0] - self.menu[0], position[1] - self.menu[1] - _MENU_TITLE
+        if not (0 <= dx <= _MENU_WIDTH and 0 <= dy < _MENU_ROW * len(_MENU_ROWS)):
+            return None
+        return dy // _MENU_ROW + 1
+
+    def _close_menu(self, position: tuple[int, int]) -> None:
+        """A button was let go while the menu showed: over a row that is a choice. Either way it closes."""
+        row = self._menu_row(position)
+        if row is not None:
+            self.chosen.append((self.menu_unit, row))
+            self._note(f"menu option {row} chosen")
+        self.menu = self.menu_unit = None
 
     # ---- what the game does to its own clock ------------------------------------
 
@@ -206,37 +259,27 @@ class MockBackend(Backend):
             return
         pressed = self._held_buttons.pop(button, None)
         if pressed is None or position is None:
+            if button == "right":
+                self.menu = self.menu_unit = None
             return
-        held_for = self.clock.now() - pressed[0]
         start = pressed[1]
         moved = math.hypot(position[0] - start[0], position[1] - start[1])
-        if button == "left":
+        if self.menu is not None:
+            # While the menu shows, a release of any button over a row chooses it, and a
+            # click anywhere else does nothing. Letting go of the right button closes it.
+            if button == "right" or self._menu_row(position) is not None:
+                self._close_menu(position)
+        elif button == "left":
             if moved > 8:
                 self._box_select(start, position)
             else:
                 self._left_click(position)
         elif button == "right":
-            if held_for >= _MENU_HOLD:
-                self.menu = position
-                self._note(f"menu opened at {position}")
-            else:
-                self._right_click(position)
+            self._right_click(position)
 
     def _left_click(self, position: tuple[int, int]) -> None:
-        if self.menu is not None:
-            mx, my = self.menu
-            if mx <= position[0] <= mx + 160 and my <= position[1] <= my + 60:
-                option = 1 if position[1] < my + 30 else 2
-                self._note(f"menu option {option} chosen")
-            self.menu = None
-            return
         add = "shift" in self._held_keys
-        nearest, best = None, _SELECT_RADIUS
-        for unit in self.units:
-            ux, uy = self._to_window(unit.x, unit.y)
-            distance = math.hypot(ux - position[0], uy - position[1])
-            if distance <= best:
-                nearest, best = unit, distance
+        nearest = self._unit_at(position)
         if not add:
             for unit in self.units:
                 unit.selected = False
@@ -302,7 +345,6 @@ class MockBackend(Backend):
         elif key == "escape":
             if self.title_screen:
                 self.quit, self.present = True, False  # no question asked
-            self.menu = None
             self.build_mode = False
         if len(key) == 1 and key.isalnum():
             self.typed += key.upper() if "shift" in self._held_keys else key
@@ -376,9 +418,13 @@ class MockBackend(Backend):
 
         if self.menu is not None:
             mx, my = self.menu
-            draw.rectangle([mx, my, mx + 160, my + 60], fill=(20, 20, 24), outline=(220, 220, 220))
-            draw.text((mx + 10, my + 6), "Option 1", fill=(240, 240, 240), font=small)
-            draw.text((mx + 10, my + 36), "Option 2", fill=(240, 240, 240), font=small)
+            height = _MENU_TITLE + _MENU_ROW * len(_MENU_ROWS)
+            draw.rectangle([mx, my, mx + _MENU_WIDTH, my + height], fill=(20, 20, 24), outline=(220, 220, 220))
+            draw.text((mx + 10, my + 3), f"Unit {self.menu_unit}", fill=(240, 190, 60), font=small)
+            for i, label in enumerate(_MENU_ROWS):
+                top = my + _MENU_TITLE + i * _MENU_ROW
+                draw.line([(mx, top), (mx + _MENU_WIDTH, top)], fill=(90, 90, 90))
+                draw.text((mx + 10, top + 6), label, fill=(240, 240, 240), font=small)
 
         for i, label in enumerate(
             text for text, shown in (("BUILD MODE", self.build_mode), ("CONVERSATION", self.conversation),
