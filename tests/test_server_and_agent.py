@@ -3,9 +3,13 @@ and the autonomous loop talking to a scripted stand-in for the Claude API."""
 
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import os
+import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -95,6 +99,64 @@ async def test_stop_file_halts_the_server(tmp_path):
         assert is_error(halted) and HALT_MARKER in halted.content[0].text
 
 
+async def test_a_pause_does_not_wait_behind_a_long_advance(tmp_path):
+    async with mcp_session(tmp_path) as session:
+        await session.initialize()
+        await session.call_tool("observe", {})
+
+        async def pause_soon():
+            await asyncio.sleep(1.0)
+            return await session.call_tool("set_speed", {"speed": "pause"})
+
+        started = time.monotonic()
+        advanced, paused = await asyncio.gather(
+            session.call_tool("advance", {"seconds": 60, "speed": "fast", "frames": 0}), pause_soon()
+        )
+        assert time.monotonic() - started < 15, "the pause was not queued behind the whole run"
+        assert not is_error(advanced) and not is_error(paused)
+        assert "less than the 60s asked for, because a pause was asked for" in advanced.content[0].text
+        assert "already paused" in paused.content[0].text
+        # Nothing lingers: the next run takes its full time.
+        again = await session.call_tool("advance", {"seconds": 0.5, "speed": "normal", "frames": 0})
+        assert "Ran the game for 0.5s" in again.content[0].text and "less than" not in again.content[0].text
+
+
+def test_the_server_pauses_the_game_and_exits_when_its_client_goes_away(tmp_path):
+    """A client that closes or crashes just closes the server's stdin. MCP clients then
+    allow about two seconds before killing the server, and whatever it holds down stays down."""
+    env = {**os.environ, "KENSHI_LINK_BACKEND": "mock", "KENSHI_LINK_HOME": str(tmp_path),
+           "KENSHI_LINK_SETTLE_SECONDS": "0.02", "KENSHI_LINK_MOTION_PROBE_SECONDS": "0.05"}
+    server = subprocess.Popen([sys.executable, "-m", "kenshi_link.server"], env=env, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def send(message: dict) -> None:
+        server.stdin.write((json.dumps(message) + "\n").encode())
+        server.stdin.flush()
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}})
+        assert b'"result"' in server.stdout.readline()
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "advance", "arguments": {"seconds": 60, "speed": "fast", "frames": 0}}})
+        time.sleep(2.5)  # the run is under way, the game unpaused
+        closed = time.monotonic()
+        server.stdin.close()
+        server.wait(timeout=10)
+        took = time.monotonic() - closed
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
+    assert took < 2.0, f"the server took {took:.1f}s to exit; a client would have killed it mid-run"
+    records = [json.loads(line) for path in (tmp_path / "sessions").glob("*.jsonl")
+               for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["action"] for record in records] == ["advance"]
+    assert records[0]["result"].startswith("Shutting down: the run was stopped after")
+    assert records[0]["result"].endswith("the game was paused.")
+
+
 # ---- the autonomous loop -------------------------------------------------------
 
 
@@ -142,9 +204,9 @@ def thinking(index: int) -> dict:
 async def run_agent(tmp_path, replies, **options):
     api = ScriptedAPI(replies)
     config = Config(backend="mock", data_dir=tmp_path)
+    options = {"quiet": True, "transcript": tmp_path / "t.jsonl", **options}
     async with mcp_session(tmp_path) as session:
-        agent = Agent(api.client(), session, AgentOptions(goal="Select unit 2 and move it.", quiet=True,
-                                                          transcript=tmp_path / "t.jsonl", **options), config)
+        agent = Agent(api.client(), session, AgentOptions(goal="Select unit 2 and move it.", **options), config)
         outcome = await agent.run()
     return api, outcome
 
@@ -241,6 +303,28 @@ async def test_truncated_tool_calls_are_not_run(tmp_path):
     assert outcome.steps == 0
     result = api.requests[1]["messages"][-1]["content"][0]
     assert result["is_error"] and "cut off" in result["content"]
+
+
+async def test_the_log_survives_text_the_console_cannot_encode(tmp_path, monkeypatch):
+    # Output redirected to a file or pipe on Windows: the system code page, and an error
+    # handler that raises on anything outside it. Claude writes arrows, CJK and emoji.
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="cp1252", errors="surrogateescape"))
+    odd = "caf\u00e9 \u2192 \u2713 \u65e5\u672c\u8a9e \U0001f3ae"
+    _, outcome = await run_agent(tmp_path, [
+        {"content": [{"type": "thinking", "thinking": f"Plan {odd}", "signature": "sig1"},
+                     text(f"Looking {odd}"), call(1, "observe")]},
+        {"content": [call(2, "manual", topic=f"no such topic {odd}")]},
+        {"content": [call(3, "end_session", report=f"Done {odd}")]},
+    ], quiet=False)
+    sys.stdout.flush()
+    printed = raw.getvalue().decode("cp1252")
+    assert outcome.reason == "ended" and outcome.steps == 2 and outcome.report == f"Done {odd}"
+    assert "(thinking) Plan caf\u00e9 ? ? ??? ?" in printed and "Claude: Looking caf\u00e9 ? ? ??? ?" in printed
+    assert "[1] observe {}" in printed and "[2] manual" in printed
+    # The transcript file keeps what the console could not show.
+    records = [json.loads(line) for line in (tmp_path / "t.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [f"Looking {odd}"] in [record.get("text") for record in records]
 
 
 def test_fallback_turns_are_echoed_per_the_api_rules():

@@ -2,11 +2,19 @@
 
 Usage: python win_window.py EVENT_LOG.jsonl
 Borderless 800x600 window at (100, 50): blue, with a red 100x100 square top-left.
+
+Usage: python win_window.py EVENT_LOG.jsonl overlay LEFT TOP WIDTH HEIGHT
+A small window of another program that stays on top without taking focus, the way a
+notification does. It logs what it receives in the same way.
+
+Posting WM_APP to either window makes it stop answering for wParam milliseconds, as a
+game does while it loads.
 """
 
 import ctypes
 import json
 import sys
+import time
 from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -17,9 +25,11 @@ LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 WS_POPUP, WS_VISIBLE = 0x80000000, 0x10000000
+WS_EX_TOPMOST, WS_EX_NOACTIVATE = 0x00000008, 0x08000000
+SW_SHOWNOACTIVATE = 4
 WM_DESTROY, WM_PAINT = 0x0002, 0x000F
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
-WM_MOUSEMOVE, WM_MOUSEWHEEL = 0x0200, 0x020A
+WM_CHAR, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_APP = 0x0102, 0x0200, 0x020A, 0x8000
 BUTTON_MESSAGES = {
     0x0201: ("left", True), 0x0202: ("left", False),
     0x0204: ("right", True), 0x0205: ("right", False),
@@ -62,6 +72,8 @@ user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
 user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
 user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
 user32.UpdateWindow.argtypes = (wintypes.HWND,)
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.GetMessageTime.restype = wintypes.LONG
 gdi32.CreateSolidBrush.argtypes = (wintypes.DWORD,)
 gdi32.CreateSolidBrush.restype = wintypes.HANDLE
 kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
@@ -73,21 +85,45 @@ def _signed16(value: int) -> int:
     return value - 0x10000 if value & 0x8000 else value
 
 
+def _use_physical_pixels() -> None:
+    """Opt this process out of Windows' display scaling.
+
+    python.exe does not declare itself DPI-aware, so on a display set to 125% or 150%
+    Windows would stretch this window (800x600 becomes 1000x750 on screen) and report
+    scaled-down coordinates to it. The self-test compares against exact pixels.
+    """
+    try:
+        ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)  # per-monitor
+        return
+    except (OSError, AttributeError):
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except AttributeError:
+        pass
+
+
 def main() -> None:
+    _use_physical_pixels()
     log = open(sys.argv[1], "a", buffering=1)
+    overlay = len(sys.argv) > 2 and sys.argv[2] == "overlay"
+    left, top, width, height = (int(value) for value in sys.argv[3:7]) if overlay else (LEFT, TOP, WIDTH, HEIGHT)
 
     def record(**fields) -> None:
-        log.write(json.dumps(fields) + "\n")
+        # "time" is when Windows took the input in (in seconds, from an arbitrary start),
+        # not when this window got round to it.
+        log.write(json.dumps({**fields, "time": (user32.GetMessageTime() & 0xFFFFFFFF) / 1000}) + "\n")
 
-    blue = gdi32.CreateSolidBrush(0x00804020)  # COLORREF is 0x00BBGGRR
+    blue = gdi32.CreateSolidBrush(0x0000C0FF if overlay else 0x00804020)  # COLORREF is 0x00BBGGRR
     red = gdi32.CreateSolidBrush(0x000000FF)
 
     def window_proc(hwnd, message, wparam, lparam):
         if message == WM_PAINT:
             paint = PAINTSTRUCT()
             hdc = user32.BeginPaint(hwnd, ctypes.byref(paint))
-            user32.FillRect(hdc, ctypes.byref(wintypes.RECT(0, 0, WIDTH, HEIGHT)), blue)
-            user32.FillRect(hdc, ctypes.byref(wintypes.RECT(0, 0, 100, 100)), red)
+            user32.FillRect(hdc, ctypes.byref(wintypes.RECT(0, 0, width, height)), blue)
+            if not overlay:
+                user32.FillRect(hdc, ctypes.byref(wintypes.RECT(0, 0, 100, 100)), red)
             user32.EndPaint(hwnd, ctypes.byref(paint))
             return 0
         if message in (WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP):
@@ -95,6 +131,14 @@ def main() -> None:
                 type="key", down=message in (WM_KEYDOWN, WM_SYSKEYDOWN), vk=int(wparam),
                 scancode=(lparam >> 16) & 0xFF, extended=bool((lparam >> 24) & 1),
             )
+            return 0
+        if message == WM_CHAR:
+            record(type="char", char=chr(wparam))
+            return 0
+        if message == WM_APP:
+            record(type="busy", milliseconds=int(wparam))
+            time.sleep(wparam / 1000)
+            record(type="answering")
             return 0
         if message in BUTTON_MESSAGES:
             button, down = BUTTON_MESSAGES[message]
@@ -123,15 +167,24 @@ def main() -> None:
     window_class.lpszClassName = "KenshiLinkTestWindow"
     if not user32.RegisterClassW(ctypes.byref(window_class)):
         raise ctypes.WinError(ctypes.get_last_error())
-    hwnd = user32.CreateWindowExW(
-        0, "KenshiLinkTestWindow", "Kenshi 1.0.64 - x64 (test window)", WS_POPUP | WS_VISIBLE,
-        LEFT, TOP, WIDTH, HEIGHT, None, None, instance, None,
-    )
+    if overlay:
+        hwnd = user32.CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE, "KenshiLinkTestWindow", "A notification (test window)", WS_POPUP,
+            left, top, width, height, None, None, instance, None,
+        )
+    else:
+        hwnd = user32.CreateWindowExW(
+            0, "KenshiLinkTestWindow", "Kenshi 1.0.64 - x64 (test window)", WS_POPUP | WS_VISIBLE,
+            left, top, width, height, None, None, instance, None,
+        )
     if not hwnd:
         raise ctypes.WinError(ctypes.get_last_error())
+    if overlay:
+        user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
     user32.UpdateWindow(hwnd)
-    user32.SetForegroundWindow(hwnd)
-    record(type="ready")
+    if not overlay:
+        user32.SetForegroundWindow(hwnd)
+    record(type="ready", hwnd=int(hwnd))
 
     message = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:

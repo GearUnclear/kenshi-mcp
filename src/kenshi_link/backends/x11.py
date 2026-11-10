@@ -182,6 +182,9 @@ class X11Backend(Backend):
         except error.XError as exc:
             raise BackendError(f"Could not focus the Kenshi window ({exc}).") from exc
 
+    def screen_rect(self) -> tuple[int, int, int, int]:
+        return (0, 0, self._screen.width_in_pixels, self._screen.height_in_pixels)
+
     # ---- capture ----------------------------------------------------------------
 
     def capture(self, left: int, top: int, width: int, height: int) -> Image.Image:
@@ -191,12 +194,15 @@ class X11Backend(Backend):
                 "The Kenshi window is partly off-screen, so it cannot be captured. "
                 "Move it fully onto the screen."
             )
-        if self._sct is None:
-            import mss
+        try:
+            if self._sct is None:
+                import mss
 
-            self._sct = (getattr(mss, "MSS", None) or mss.mss)()  # mss >= 10 renamed the class
-        shot = self._sct.grab({"left": left, "top": top, "width": width, "height": height})
-        return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                self._sct = (getattr(mss, "MSS", None) or mss.mss)()  # mss >= 10 renamed the class
+            shot = self._sct.grab({"left": left, "top": top, "width": width, "height": height})
+            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception as exc:  # mss raises its own error type
+            raise BackendError(f"The screen could not be captured ({exc}).") from exc
 
     # ---- input ------------------------------------------------------------------
 

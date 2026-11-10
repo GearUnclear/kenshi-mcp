@@ -53,6 +53,12 @@ DEFAULT_KEYMAP: dict[str, str] = {
 
 SPEEDS = ("pause", "normal", "fast", "fastest")
 
+_DURATIONS = (
+    "settle_seconds", "click_hold_seconds", "key_hold_seconds", "pointer_dwell_seconds",
+    "modifier_gap_seconds", "mouse_move_seconds", "drag_seconds", "motion_probe_seconds",
+    "max_advance_seconds", "max_hold_seconds",
+)
+
 
 def default_data_dir() -> Path:
     override = os.environ.get("KENSHI_LINK_HOME")
@@ -76,16 +82,21 @@ class Config:
     jpeg_quality: int = 80
     mark_pointer: bool = True  # ring the last click/drag end on the returned image
 
-    # Timing, in seconds.
+    # Timing, in seconds. Kenshi reads the mouse and the keyboard once per frame, as two
+    # separate devices, so anything that must be seen in a particular order has to stay
+    # put for longer than a frame. The defaults allow for about 10 frames per second.
     settle_seconds: float = 0.35  # wait after an input before the screenshot
-    click_hold_seconds: float = 0.06
-    key_hold_seconds: float = 0.06
+    click_hold_seconds: float = 0.1  # how long a mouse button stays down
+    key_hold_seconds: float = 0.1  # how long a key stays down
+    pointer_dwell_seconds: float = 0.12  # the pointer rests on its target before a button or the wheel
+    modifier_gap_seconds: float = 0.12  # between shift/ctrl/alt and the click they are held for
     mouse_move_seconds: float = 0.08
     mouse_move_steps: int = 6
     drag_seconds: float = 0.3
     motion_probe_seconds: float = 0.3
     max_advance_seconds: float = 120.0
     max_hold_seconds: float = 10.0
+    halt_poll_seconds: float = 0.1  # how often a running advance or a long hold checks for a stop
 
     # Above this share of pixels changing between two frames, the scene is "moving".
     motion_threshold: float = 0.0001
@@ -93,6 +104,7 @@ class Config:
     # Safety.
     auto_focus: bool = True  # bring Kenshi to the front when it is not focused
     allow_debug_keys: bool = False
+    allow_shift_tab: bool = False  # Shift+Tab is Steam's overlay key
     failsafe_corner: bool = True  # operator parks the mouse at the screen's top-left to stop
     panic_key: bool = True  # operator holds Pause/Break to stop
 
@@ -127,10 +139,17 @@ class Config:
             raise ValueError(f"image_format must be jpeg or png (got {self.image_format!r})")
         if not 64 <= self.max_long_edge <= 2576:
             raise ValueError("max_long_edge must be between 64 and 2576")
+        for name in _DURATIONS:
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if not 0.01 <= self.halt_poll_seconds <= 1:
+            raise ValueError("halt_poll_seconds must be between 0.01 and 1")
         for action, combo in self.keymap.items():
             try:
                 mods, key = parse_combo(combo)
-                check_allowed(mods, key, allow_debug_keys=self.allow_debug_keys)
+                check_allowed(
+                    mods, key, allow_debug_keys=self.allow_debug_keys, allow_shift_tab=self.allow_shift_tab
+                )
             except Exception as exc:
                 raise ValueError(f"keymap entry {action} = {combo!r} is not usable: {exc}") from exc
         for required in ("pause", "speed_normal", "speed_fast", "speed_fastest"):
@@ -167,8 +186,14 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
     known = {f.name for f in fields(Config)}
 
     if path.is_file():
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
+        try:
+            # utf-8-sig: Windows editors and PowerShell often put a byte-order mark at the
+            # start of a UTF-8 file, which TOML itself does not allow.
+            data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{path} is not UTF-8 text; save it with UTF-8 encoding ({exc})") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
         for key, value in data.items():
             if key == "keymap":
                 if not isinstance(value, dict):

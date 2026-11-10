@@ -13,8 +13,9 @@
 # - A value that contains backslashes (the regular expressions below, or any Windows path such
 #   as 'C:\Users\you\Documents') must be in single quotes. In double quotes a backslash starts
 #   an escape sequence and the file is rejected.
-# - Save the file as UTF-8 without a byte-order mark. If kenshi-link then reports
-#   "Invalid statement (at line 1, column 1)", the editor added one.
+# - Save the file as UTF-8 (with or without a byte-order mark). If kenshi-link reports that the
+#   file "is not UTF-8 text", it was saved as something else, such as the UTF-16 that Windows
+#   PowerShell's ">" writes.
 
 # Which game interface to use. "auto" means windows on Windows and x11 on Linux; "mock" is the
 # built-in stand-in for trying things without the game.
@@ -29,14 +30,25 @@
 # Seconds to wait after an input before taking the screenshot.
 # settle_seconds = 0.35
 
+# Pacing of input, in seconds. Kenshi reads the mouse and the keyboard once per frame, so each
+# of these should be longer than one frame takes. The defaults allow for about 10 frames per
+# second; raise them if clicks land short of the ring or Shift+click acts like a plain click.
+# pointer_dwell_seconds = 0.12   # the pointer rests on its target before a button or the wheel
+# modifier_gap_seconds = 0.12    # between Shift/Ctrl/Alt and the click they are held for
+# click_hold_seconds = 0.1       # how long a mouse button stays down
+# key_hold_seconds = 0.1         # how long a key stays down
+
 # Longest single advance() Claude may ask for, in real seconds.
 # max_advance_seconds = 120.0
 
 # Safety
 # auto_focus = true           # bring Kenshi to the front when it has lost focus
-# failsafe_corner = true      # mouse in the top-left corner of the primary screen stops everything
-# panic_key = true            # holding Pause/Break stops everything
+# failsafe_corner = true      # mouse in the top-left corner of the screen stops everything
+#                             # (with several monitors: the corner of the leftmost one)
+# panic_key = true            # Pause/Break stops everything
+# halt_poll_seconds = 0.1     # how often a running advance or a long hold looks for a stop
 # allow_debug_keys = false    # permit Kenshi's debug shortcuts (Shift+F12 etc.)
+# allow_shift_tab = false     # permit Shift+Tab, which opens the Steam overlay
 
 # Keep every screenshot for later review, in
 # %USERPROFILE%\.kenshi-link\sessions\<date-time>\ (00001.jpg, 00002.jpg, ...).

@@ -103,8 +103,48 @@ def key_input(scancode: int, extended: bool, down: bool, vk: int = 0) -> INPUT:
 
 
 def absolute_coords(x: int, y: int, virtual: tuple[int, int, int, int]) -> tuple[int, int]:
-    """Map a screen pixel to SendInput's 0..65535 space across the whole virtual desktop."""
+    """Map a screen pixel to SendInput's 0..65535 space across the whole virtual desktop.
+
+    Microsoft does not document how Windows rounds on the way back. AutoHotkey's source
+    records it as pixel = value * size // 65536 (Wine does the same), under which the
+    obvious pixel * 65535 / (size - 1) lands one pixel short near the top-left of the
+    screen. Aiming just past the start of the pixel's own interval lands on it exactly.
+    """
     vx, vy, vw, vh = virtual
-    nx = round((x - vx) * 65535 / max(1, vw - 1))
-    ny = round((y - vy) * 65535 / max(1, vh - 1))
+    nx = (x - vx) * 65536 // max(1, vw) + 1
+    ny = (y - vy) * 65536 // max(1, vh) + 1
     return max(0, min(65535, nx)), max(0, min(65535, ny))
+
+
+def top_left_corner(monitors: list[tuple[int, int, int, int]]) -> tuple[int, int]:
+    """The corner of the desktop that a mouse pushed up and to the left ends up in.
+
+    `monitors` are (left, top, right, bottom) rectangles. With one monitor that is (0, 0).
+    With another monitor to the left of or above the primary one, (0, 0) is in the middle
+    of the desktop and the pointer slides straight past it, so the corner used is that of
+    the leftmost monitor (the upper one if two are level).
+    """
+    if not monitors:
+        return (0, 0)
+    left, top, _, _ = min(monitors, key=lambda rect: (rect[0], rect[1]))
+    return (left, top)
+
+
+def elevation_problem(ours: bool | None, theirs: bool | None) -> str | None:
+    """Why input cannot reach the game, given who runs as administrator, or None if it can.
+
+    Each argument is True (elevated), False (not) or None (Windows refused to say). Windows
+    silently drops input sent to a more privileged program, and SendInput reports success
+    all the same, so this has to be worked out beforehand. A game we are refused a look
+    at, when we are not elevated ourselves, is taken to be elevated: that refusal is how
+    Windows treats questions about a more privileged program.
+    """
+    if ours is not False or theirs is False:
+        return None
+    seems = "is" if theirs else "appears to be"
+    return (
+        f"Kenshi {seems} running as administrator and kenshi-link is not, so Windows silently "
+        "discards every key and click sent to the game. Nothing was sent. Ask the operator to "
+        "start both at the same level: either restart Kenshi (and Steam) normally, or start the "
+        "program that launches kenshi-link (PowerShell, Claude Code or Claude Desktop) as administrator."
+    )

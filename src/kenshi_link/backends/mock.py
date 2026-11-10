@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from PIL import Image, ImageDraw, ImageFont
 
 from ..config import Config
+from ..keys import char_to_key
 from .base import Backend, Clock, WindowInfo
 
 _SPEED_KEYS = {"f2": 1.0, "f3": 2.0, "f4": 4.0}
@@ -58,7 +59,19 @@ class MockBackend(Backend):
         self._held_keys: dict[str, float] = {}
         self._held_buttons: dict[str, tuple[float, tuple[int, int]]] = {}
         self._last_tick = self.clock.now()
-        self.panic = False
+        self.stamps: list[float] = []  # when each entry of `events` happened
+        # Things a test can set to stand in for the operator and the desktop.
+        self.panic = False  # the panic key is being held
+        self.panic_callback = None  # called for a panic-key press, however short
+        self.obstructed = False  # another window lies over the game at the pointer
+        self.screen: tuple[int, int, int, int] | None = None  # desktop bounds, if they matter
+        self.corner = (0, 0)  # the failsafe corner
+        self.layout: dict[str, tuple[str, bool]] | None = None  # a non-US keyboard layout
+        self.caps = False  # Caps Lock is on
+
+    def _record(self, *event) -> None:
+        self.events.append(event)
+        self.stamps.append(self.clock.now())
 
     # ---- simulation -------------------------------------------------------------
 
@@ -125,7 +138,7 @@ class MockBackend(Backend):
         )
 
     def focus(self) -> None:
-        self.events.append(("focus",))
+        self._record("focus")
         self.focused = True
 
     def capture(self, left: int, top: int, width: int, height: int) -> Image.Image:
@@ -137,11 +150,11 @@ class MockBackend(Backend):
     def move(self, x: int, y: int) -> None:
         self._tick()
         self._pointer = (x, y)
-        self.events.append(("move", x, y))
+        self._record("move", x, y)
 
     def button(self, button: str, down: bool) -> None:
         self._tick()
-        self.events.append(("button", button, down, *self._pointer))
+        self._record("button", button, down, *self._pointer)
         if not self.focused:
             return
         position = self._pointer_in_window()
@@ -207,13 +220,13 @@ class MockBackend(Backend):
 
     def wheel(self, clicks: int) -> None:
         self._tick()
-        self.events.append(("wheel", clicks))
+        self._record("wheel", clicks)
         if self.focused:
             self.zoom = max(0.25, min(4.0, self.zoom * (1.1**clicks)))
 
     def key(self, key: str, down: bool) -> None:
         self._tick()
-        self.events.append(("key", key, down))
+        self._record("key", key, down)
         if not self.focused:
             return
         if not down:
@@ -241,6 +254,26 @@ class MockBackend(Backend):
 
     def panic_pressed(self) -> bool:
         return self.panic
+
+    def watch_panic(self, callback) -> None:
+        self.panic_callback = callback
+
+    def pointer_on_window(self) -> bool:
+        return not self.obstructed
+
+    def screen_rect(self) -> tuple[int, int, int, int] | None:
+        return self.screen
+
+    def failsafe_corner(self) -> tuple[int, int]:
+        return self.corner
+
+    def typing_keys(self, text: str) -> list[tuple[str, bool]] | None:
+        if self.layout is None:
+            return None
+        return [self.layout.get(char, char_to_key(char)) for char in text]
+
+    def caps_lock(self) -> bool:
+        return self.caps
 
     # ---- drawing ----------------------------------------------------------------
 

@@ -14,6 +14,8 @@ Three ideas shape it:
 from __future__ import annotations
 
 import json
+import locale
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,10 +23,10 @@ from pathlib import Path
 from PIL import Image
 
 from . import imaging
-from .backends import Backend, BackendError, Clock, WindowInfo, create_backend
-from .backends.base import BUTTONS
+from .backends import Backend, BackendError, Clock, WindowInfo, WindowNotFound, create_backend
+from .backends.base import BUTTONS, DesktopUnavailable
 from .config import SPEEDS, Config
-from .keys import BlockedInput, char_to_key, check_allowed, parse_combo, parse_modifiers
+from .keys import BlockedInput, char_to_key, check_allowed, check_modifiers, parse_combo, parse_modifiers
 
 HALT_MARKER = "KENSHI_LINK_HALTED"
 
@@ -43,7 +45,14 @@ CAMERA_ACTIONS = (
 _TIME_ACTIONS = ("pause", "speed_normal", "speed_fast", "speed_fastest")
 _CAMERA_STEP_SECONDS = 0.25
 _TILT_STEP_PIXELS = 40
-_EDGE_MARGIN = 3
+# The operator stops everything by pushing the mouse into the corner of the screen: a
+# pointer within this many pixels of it, each way, counts. The pointer must never be put
+# there by this program, or the next check would take its own move for the operator's.
+_CORNER_ZONE = 3
+# Pointer targets keep this far from the window's edges. More than the corner zone, so
+# that a click in the corner of a borderless window at the corner of the screen stays
+# clear of it even if it lands a pixel off.
+_EDGE_MARGIN = _CORNER_ZONE + 2
 
 
 class ControlError(Exception):
@@ -51,7 +60,11 @@ class ControlError(Exception):
 
 
 class Halted(ControlError):
-    """The operator stopped the session. No more input will be sent."""
+    """The operator stopped the session, or the desktop is out of reach. No more input will be sent."""
+
+
+class Interrupted(ControlError):
+    """A sequence was cut short because the program is shutting down."""
 
 
 @dataclass
@@ -87,6 +100,11 @@ class Controller:
         self._held: list[tuple[str, str]] = []
         self._session = time.strftime("%Y%m%d-%H%M%S")
         self._frame_number = 0
+        # Set from other threads (see request_pause and shutdown); read on the one that acts.
+        self._pause_requested = threading.Event()
+        self._closing = threading.Event()
+        if config.panic_key:
+            self.backend.watch_panic(self._panic_seen)
 
     # ---- operator stop ----------------------------------------------------------
 
@@ -97,32 +115,78 @@ class Controller:
             "the operator."
         )
 
-    def _trip(self, reason: str) -> None:
+    def _write_stop(self, reason: str) -> None:
         try:
             self.config.data_dir.mkdir(parents=True, exist_ok=True)
-            self.config.stop_file.write_text(f"{reason}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.config.stop_file.write_text(
+                f"{reason}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8"
+            )
         except OSError:
             pass
+
+    def _panic_seen(self) -> None:
+        """The backend noticed a press of the panic key. This can run on any thread, at any
+        time, so it only leaves the stop file for the next check to find."""
+        self._write_stop("the operator pressed Pause/Break")
+
+    def _forget_pause(self) -> None:
         self.paused = None
         self.pause_source = "unknown"
 
+    def _in_corner(self, x: int, y: int) -> bool:
+        corner_x, corner_y = self.backend.failsafe_corner()
+        return 0 <= x - corner_x < _CORNER_ZONE and 0 <= y - corner_y < _CORNER_ZONE
+
+    def _clear_of_corner(self, x: int, y: int) -> tuple[int, int]:
+        """The nearest screen point to (x, y) that the operator's corner check cannot mistake."""
+        if not self.config.failsafe_corner:
+            return x, y
+        corner_x, corner_y = self.backend.failsafe_corner()
+        reach = _CORNER_ZONE + 1  # one spare pixel
+        dx, dy = x - corner_x, y - corner_y
+        if not (0 <= dx < reach and 0 <= dy < reach):
+            return x, y
+        return (corner_x + reach, y) if dx >= dy else (x, corner_y + reach)
+
+    def _control_error(self, exc: BackendError) -> ControlError:
+        """A backend failure in the form Claude should see it."""
+        if isinstance(exc, DesktopUnavailable):
+            # Nothing Claude can do will help, and each retry costs a turn: say so the way
+            # an operator stop is said. No stop file: it ends when the desktop is back.
+            return Halted(f"{HALT_MARKER}: {exc}. Do not retry; stop and tell the operator.")
+        return ControlError(str(exc))
+
     def _check_halt(self) -> None:
         if self.config.stop_file.exists():
-            try:
-                reason = self.config.stop_file.read_text().strip().splitlines()[0]
-            except (OSError, IndexError):
-                reason = "stop file present"
-            raise Halted(self._halt_message(reason or "stop file present"))
+            self._forget_pause()  # the operator has had the controls since
+            raise Halted(self._halt_message(_stop_reason(self.config.stop_file)))
         reason = None
-        if self.config.panic_key and self.backend.panic_pressed():
-            reason = "the operator pressed Pause/Break"
-        elif self.config.failsafe_corner:
-            x, y = self.backend.cursor()
-            if 0 <= x <= 2 and 0 <= y <= 2:
+        try:
+            if self.config.panic_key and self.backend.panic_pressed():
+                reason = "the operator pressed Pause/Break"
+            elif self.config.failsafe_corner and self._in_corner(*self.backend.cursor()):
                 reason = "the operator moved the mouse to the top-left corner of the screen"
+        except BackendError as exc:
+            raise self._control_error(exc) from exc
         if reason:
-            self._trip(reason)
+            self._write_stop(reason)
+            self._forget_pause()
             raise Halted(self._halt_message(reason))
+
+    def _poll(self) -> None:
+        """The check made between the steps of a sequence: an operator stop, or shutdown."""
+        self._check_halt()
+        if self._closing.is_set():
+            raise Interrupted("kenshi-link is shutting down, so the rest was not sent.")
+
+    def request_pause(self) -> None:
+        """Ask a running advance() to stop early and pause now. Safe to call from any thread."""
+        self._pause_requested.set()
+
+    def shutdown(self) -> None:
+        """Wind up from another thread: whatever is in progress stops at its next check, an
+        advance pauses the game first, and no new action starts. close() must still be called."""
+        self._closing.set()
 
     # ---- window and pixels ------------------------------------------------------
 
@@ -140,15 +204,29 @@ class Controller:
                 self.clock.sleep(0.25)
                 info = self.backend.locate()
                 if not info.focused:
+                    why = self.backend.focus_error()
                     raise ControlError(
                         "Kenshi could not be brought to the front, so nothing was sent or captured "
-                        "(keys must never reach another program). Ask the operator to click on the "
-                        "game window."
+                        f"(keys must never reach another program). {why + ' ' if why else ''}"
+                        "Ask the operator to click on the game window."
                     )
+            bounds = self.backend.screen_rect()
         except BackendError as exc:
-            raise ControlError(str(exc)) from exc
+            raise self._control_error(exc) from exc
         if info.width < 64 or info.height < 64:
             raise ControlError("The Kenshi window is minimised or too small to use.")
+        if bounds is not None and not (
+            bounds[0] <= info.left
+            and bounds[1] <= info.top
+            and info.left + info.width <= bounds[0] + bounds[2]
+            and info.top + info.height <= bounds[1] + bounds[3]
+        ):
+            # The part off the screen cannot be captured, and a click aimed there lands on
+            # whatever is at the screen's edge instead.
+            raise ControlError(
+                "The Kenshi window is partly off the screen, so nothing was sent or captured. Ask "
+                "the operator to move it fully onto the screen, or to switch the game to borderless."
+            )
         return info
 
     def _fit(self, info: WindowInfo) -> imaging.Fit:
@@ -158,7 +236,7 @@ class Controller:
         try:
             return self.backend.capture(info.left, info.top, info.width, info.height)
         except BackendError as exc:
-            raise ControlError(str(exc)) from exc
+            raise self._control_error(exc) from exc
 
     def _window_point(self, info: WindowInfo, x: float, y: float, what: str = "Point") -> tuple[int, int]:
         """Screenshot pixels -> window pixels, rejecting anything outside the picture."""
@@ -218,7 +296,19 @@ class Controller:
         if ("key", key) in self._held:
             self._held.remove(("key", key))
 
+    def _require_pointer_on_game(self) -> None:
+        """Focus decides where keys go, but a click or the wheel goes to whatever is under
+        the pointer: refuse if that is not the game."""
+        if not self.backend.pointer_on_window():
+            raise ControlError(
+                "Another window is covering the game where the pointer is (a notification, the "
+                "taskbar or something set to stay on top), so the click was not sent: it would have "
+                "gone to that window. Use observe to see what is in the way; wait for it to go, "
+                "or pick a spot it does not cover."
+            )
+
     def _button_down(self, button: str) -> None:
+        self._require_pointer_on_game()
         self.backend.button(button, True)
         self._held.append(("button", button))
 
@@ -239,39 +329,98 @@ class Controller:
                 pass
         self._held.clear()
 
-    def _tap(self, combo: str, hold: float = 0.0) -> None:
+    def _wheel(self, clicks: int) -> None:
+        self._require_pointer_on_game()
+        self.backend.wheel(clicks)
+
+    def _hold(self, seconds: float) -> None:
+        """Wait with something held down, looking out for an operator stop meanwhile.
+
+        A stop raises from here; _input then releases whatever is held.
+        """
+        end = self.clock.now() + seconds
+        while (remaining := end - self.clock.now()) > 1e-9:
+            self.clock.sleep(min(self.config.halt_poll_seconds, remaining))
+            if end - self.clock.now() > 1e-9:
+                self._poll()
+
+    def _tap(self, combo: str, hold: float = 0.0, *, checked: bool = True) -> None:
+        """Press and release a key or combo.
+
+        `checked=False` is for the keys that control game time: they are sent whatever
+        else is going on, because they are how a run is brought to a stop.
+        """
         mods, key = parse_combo(combo)
+        if checked:
+            self._poll()
         for mod in mods:
             self._key_down(mod)
         self._key_down(key)
-        self.clock.sleep(max(self.config.key_hold_seconds, hold))
+        if checked:
+            self._hold(max(self.config.key_hold_seconds, hold))
+        else:
+            self.clock.sleep(max(self.config.key_hold_seconds, hold))
         self._key_up(key)
         for mod in reversed(mods):
             self._key_up(mod)
         self.clock.sleep(0.04)
 
+    def _modifiers_down(self, mods: list[str]) -> None:
+        for mod in mods:
+            self._key_down(mod)
+        if mods:
+            # The game reads keyboard and mouse separately, once a frame each: without a
+            # pause the click can be handled before the modifier is seen to be down.
+            self.clock.sleep(self.config.modifier_gap_seconds)
+
+    def _modifiers_up(self, mods: list[str]) -> None:
+        if mods:
+            self.clock.sleep(self.config.modifier_gap_seconds)  # ... or after it is seen to be up
+        for mod in reversed(mods):
+            self._key_up(mod)
+
     def _glide(self, info: WindowInfo, wx: int, wy: int, seconds: float | None = None) -> None:
-        """Move the pointer in a few steps so the game sees motion, ending exactly on target."""
-        target = (info.left + wx, info.top + wy)
+        """Move the pointer in a few steps so the game sees motion, ending exactly on target.
+
+        The operator's stop is checked before every step: once the pointer has been pulled
+        away from the corner they parked it in, nothing could tell it had been there.
+        """
+        target = self._clear_of_corner(info.left + wx, info.top + wy)
         start = self.backend.cursor()
         steps = max(1, self.config.mouse_move_steps)
         duration = self.config.mouse_move_seconds if seconds is None else seconds
         for i in range(1, steps):
             t = i / steps
+            self._poll()
             self.backend.move(
-                round(start[0] + (target[0] - start[0]) * t), round(start[1] + (target[1] - start[1]) * t)
+                *self._clear_of_corner(
+                    round(start[0] + (target[0] - start[0]) * t), round(start[1] + (target[1] - start[1]) * t)
+                )
             )
             self.clock.sleep(duration / steps)
+        self._poll()
         self.backend.move(*target)
-        self.clock.sleep(0.03)
-        self._pointer = (wx, wy)
+        # The game takes the pointer's position once per frame, and handles a button before
+        # the movement that arrived in the same frame: rest here until it has caught up.
+        self.clock.sleep(self.config.pointer_dwell_seconds)
+        self._poll()  # before the pointer is touched again: the operator may have taken it
+        if self.backend.cursor() != target:
+            # The platform's coordinate rounding (or a nudge of the mouse) left it elsewhere.
+            self.backend.place(*target)
+            self.clock.sleep(self.config.pointer_dwell_seconds)
+        self._pointer = (target[0] - info.left, target[1] - info.top)
 
     def _require_focus(self, doing: str) -> None:
         """Mid-sequence check: stop, rather than refocus, if the game lost focus."""
         try:
             focused = self.backend.locate().focused
-        except BackendError:
+        except WindowNotFound:
             focused = False
+        except BackendError as exc:
+            error = self._control_error(exc)
+            if isinstance(error, Halted):
+                raise error from exc
+            raise ControlError(f"{exc} That was noticed while {doing}, so the rest was not sent.") from exc
         if not focused:
             raise ControlError(
                 f"Kenshi lost focus while {doing}, so the rest was not sent. Look at the screen "
@@ -279,18 +428,20 @@ class Controller:
             )
 
     def _begin(self) -> WindowInfo:
+        if self._closing.is_set():
+            raise Interrupted("kenshi-link is shutting down; nothing was sent.")
         self._check_halt()
         info = self._window()
         self.actions += 1
         return info
 
-    def _input(self, function, *args):
+    def _input(self, function, *args, **kwargs):
         """Run an input sequence, releasing everything if it fails part-way."""
         try:
-            return function(*args)
+            return function(*args, **kwargs)
         except BackendError as exc:
             self._release_all()
-            raise ControlError(str(exc)) from exc
+            raise self._control_error(exc) from exc
         except BaseException:
             self._release_all()
             raise
@@ -350,9 +501,9 @@ class Controller:
             _, motion = self._probe(info)
             notes.append(self._infer_pause(motion))
         if self.paused:
-            self._tap(self.config.keymap["pause"])
+            self._tap(self.config.keymap["pause"], checked=False)
             self.clock.sleep(0.08)
-        self._tap(self.config.keymap[f"speed_{speed}"])
+        self._tap(self.config.keymap[f"speed_{speed}"], checked=False)
         self.paused = False
         self.pause_source = "tracked"
         self.speed = speed
@@ -437,16 +588,14 @@ class Controller:
 
         def run() -> None:
             self._glide(info, wx, wy)
-            for mod in mods:
-                self._key_down(mod)
+            self._modifiers_down(mods)
             for i in range(count):
                 self._button_down(button)
-                self.clock.sleep(max(self.config.click_hold_seconds, hold_seconds))
+                self._hold(max(self.config.click_hold_seconds, hold_seconds))
                 self._button_up(button)
                 if i < count - 1:
                     self.clock.sleep(0.09)
-            for mod in reversed(mods):
-                self._key_up(mod)
+            self._modifiers_up(mods)
 
         self._input(run)
         kind = {1: "", 2: "double-", 3: "triple-"}[count]
@@ -470,15 +619,13 @@ class Controller:
 
         def run() -> None:
             self._glide(info, *start)
-            for mod in mods:
-                self._key_down(mod)
+            self._modifiers_down(mods)
             self._button_down(button)
             self.clock.sleep(0.08)
             self._glide(info, *end, seconds=self.config.drag_seconds)
             self.clock.sleep(0.08)
             self._button_up(button)
-            for mod in reversed(mods):
-                self._key_up(mod)
+            self._modifiers_up(mods)
 
         self._input(run)
         lines = [f"Dragged the {button} button from ({x0:g}, {y0:g}) to ({x1:g}, {y1:g})."]
@@ -496,7 +643,7 @@ class Controller:
         def run() -> None:
             self._glide(info, wx, wy)
             for _ in range(amount):
-                self.backend.wheel(1 if direction == "up" else -1)
+                self._wheel(1 if direction == "up" else -1)
                 self.clock.sleep(0.03)
 
         self._input(run)
@@ -509,14 +656,19 @@ class Controller:
 
     def _modifiers(self, modifiers: str) -> list[str]:
         try:
-            return parse_modifiers(modifiers)
+            mods = parse_modifiers(modifiers)
+            check_modifiers(mods)
         except BlockedInput as exc:
             raise ControlError(str(exc)) from exc
+        return mods
 
     def _checked_combo(self, combo: str) -> tuple[list[str], str]:
         try:
             mods, key = parse_combo(combo)
-            check_allowed(mods, key, allow_debug_keys=self.config.allow_debug_keys)
+            check_allowed(
+                mods, key, allow_debug_keys=self.config.allow_debug_keys,
+                allow_shift_tab=self.config.allow_shift_tab,
+            )
         except BlockedInput as exc:
             raise ControlError(str(exc)) from exc
         return mods, key
@@ -561,9 +713,19 @@ class Controller:
             raise ControlError("text is limited to 200 characters per call.")
         try:
             strokes = [char_to_key(char) for char in text]
+            self._begin()
+            if self.backend.caps_lock() and any(char.isalpha() for char in text):
+                raise ControlError(
+                    "Caps Lock is on, so the letters would come out in the wrong case. Nothing was "
+                    "typed. Ask the operator to turn Caps Lock off."
+                )
+            # Key names are positions on a US keyboard; the game turns key presses into
+            # characters with the operator's layout, which may put them elsewhere.
+            strokes = self.backend.typing_keys(text) or strokes
         except BlockedInput as exc:
             raise ControlError(str(exc)) from exc
-        self._begin()
+        except BackendError as exc:
+            raise self._control_error(exc) from exc
 
         def run() -> None:
             for i, (name, shift) in enumerate(strokes):
@@ -602,7 +764,7 @@ class Controller:
             def hold_and_look() -> Result:
                 for key in [*mods, name]:
                     self._key_down(key)
-                self.clock.sleep(max(0.5, self.config.settle_seconds))
+                self._hold(max(0.5, self.config.settle_seconds))
                 info = self._window()
                 shot = self._shot(info)
                 for key in reversed([*mods, name]):
@@ -640,7 +802,7 @@ class Controller:
             if action in ("zoom_in", "zoom_out"):
                 self._glide(info, *centre)
                 for _ in range(steps):
-                    self.backend.wheel(1 if action == "zoom_in" else -1)
+                    self._wheel(1 if action == "zoom_in" else -1)
                     self.clock.sleep(0.03)
             elif action in ("tilt_up", "tilt_down"):
                 travel = min(steps * _TILT_STEP_PIXELS, info.height // 2 - 2 * _EDGE_MARGIN - 1)
@@ -664,6 +826,13 @@ class Controller:
     def set_speed(self, speed: str) -> Result:
         if speed not in SPEEDS:
             raise ControlError(f"speed must be one of: {', '.join(SPEEDS)}.")
+        try:
+            return self._set_speed(speed)
+        finally:
+            if speed == "pause":
+                self._pause_requested.clear()  # this call was the request (see request_pause)
+
+    def _set_speed(self, speed: str) -> Result:
         info = self._begin()
         lines: list[str] = []
 
@@ -675,7 +844,7 @@ class Controller:
                 if self.paused:
                     lines.append("The game is already paused; nothing was pressed.")
                 else:
-                    self._tap(self.config.keymap["pause"])
+                    self._tap(self.config.keymap["pause"], checked=False)
                     self.paused = True
                     self.pause_source = "tracked"
                     lines.append("Paused the game.")
@@ -702,6 +871,7 @@ class Controller:
         if not 0 <= frames <= 4:
             raise ControlError("frames must be between 0 and 4.")
         info = self._begin()
+        arguments = {"seconds": seconds, "speed": speed, "frames": frames}
         lines: list[str] = []
         samples: list[Image.Image] = []
 
@@ -711,35 +881,50 @@ class Controller:
         self._input(start)
         began = self.clock.now()
         sample_times = [began + seconds * (i + 1) / (frames + 1) for i in range(frames)]
+        left_running = f"The game was not paused: it was left running at {speed} speed."
         interrupted: Halted | None = None
+        cut_short = ""  # why the run ended before its time, if it did
         while True:
             now = self.clock.now()
             if now >= began + seconds:
                 break
-            self.clock.sleep(min(0.1, began + seconds - now))
+            self.clock.sleep(min(self.config.halt_poll_seconds, began + seconds - now))
+            if self._closing.is_set() or self._pause_requested.is_set():
+                self._pause_requested.clear()
+                cut_short = "a pause was asked for"
+                break
             try:
                 self._check_halt()
             except Halted as exc:
                 interrupted = exc
+                break
+            except Exception as exc:
+                # The stop checks themselves are failing. Do not sit out the rest of the
+                # run blind: pause now, and report what went wrong with the result.
+                cut_short = f"the operator's stop could not be checked ({exc})"
                 break
             if sample_times and self.clock.now() >= sample_times[0]:
                 sample_times.pop(0)
                 try:
                     current = self.backend.locate()
                     if current.focused:  # never capture whatever else is on top
-                        samples.append(self._grab(current))
-                except (BackendError, ControlError):
-                    pass
+                        samples.append(
+                            self.backend.capture(current.left, current.top, current.width, current.height)
+                        )
+                except Exception:
+                    pass  # a missed frame is not worth the run; a real problem shows at the pause
+        ran_for = self.clock.now() - began
         if interrupted is not None:
             # The operator has taken over; send nothing more, not even the pause key.
-            self.paused = None
-            self.pause_source = "unknown"
-            raise interrupted
-        ran_for = self.clock.now() - began
+            self._forget_pause()
+            raise Halted(f"{interrupted} {left_running}") from interrupted
 
         try:
             info = self._window()
-            self._input(self._tap, self.config.keymap["pause"])
+            self._input(self._tap, self.config.keymap["pause"], checked=False)
+        except Halted as exc:  # the desktop went away (locked screen): the key cannot get there
+            self.paused = False
+            raise Halted(f"{exc} {left_running}") from exc
         except ControlError as exc:
             self.paused = False
             raise ControlError(
@@ -748,11 +933,17 @@ class Controller:
             ) from exc
         self.paused = True
         self.pause_source = "tracked"
+        if self._closing.is_set():
+            text = f"Shutting down: the run was stopped after {ran_for:.1f}s and the game was paused."
+            self._log("advance", arguments, text)
+            raise Interrupted(text)
 
         self.clock.sleep(self.config.settle_seconds)
         info = self._window()
         frame, motion = self._probe(info)
         lines.append(f"Ran the game for {ran_for:.1f}s of real time at {speed} speed, then paused it.")
+        if cut_short:
+            lines.append(f"That is less than the {seconds:g}s asked for, because {cut_short}.")
         images: list[Shot] = []
         strip = imaging.filmstrip(samples)
         if strip is not None:
@@ -763,7 +954,6 @@ class Controller:
             )
         images.append(self._shot(info, frame))
         lines += self._reconcile(motion)
-        arguments = {"seconds": seconds, "speed": speed, "frames": frames}
         return self._finish("advance", arguments, lines, info, images, motion)
 
     def sync_pause(self, paused: bool) -> Result:
@@ -780,8 +970,10 @@ class Controller:
         lines = [f"backend: {self.backend.name}"]
         try:
             info = self.backend.locate()
-        except BackendError as exc:
+        except WindowNotFound as exc:
             return "\n".join([*lines, f"window: NOT FOUND - {exc}"])
+        except BackendError as exc:
+            return "\n".join([*lines, f"window: UNUSABLE - {exc}"])
         fit = self._fit(info) if info.width and info.height else None
         lines.append(f"window: {info.title!r}")
         lines.append(f"client area: {info.width}x{info.height} at ({info.left}, {info.top}) on screen")
@@ -789,16 +981,49 @@ class Controller:
         if fit:
             lines.append(f"screenshot size sent to Claude: {fit.width}x{fit.height} (scale {fit.scale:.3f})")
         lines.append(f"stop file: {'PRESENT - input disabled' if self.config.stop_file.exists() else 'absent'}")
+        lines += self.backend.notes()
         return "\n".join(lines)
+
+    def release_held(self) -> None:
+        """Let go of every key and button this controller is holding down."""
+        self._release_all()
 
     def close(self) -> None:
         self._release_all()
         self.backend.close()
 
 
+def _decode(data: bytes) -> str:
+    """Text from a file the operator may have written with any tool; it never fails.
+
+    These files are UTF-8 when kenshi-link writes them. Windows editors and PowerShell may
+    add a byte-order mark, PowerShell's `>` writes UTF-16, and older editors save in the
+    system code page.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16", errors="replace")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode(locale.getencoding(), errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _stop_reason(path: Path) -> str:
+    """The first line of the stop file. Its existence is what stops input; the text is
+    only shown as the reason, so an unreadable or empty file still stops everything."""
+    try:
+        text = _decode(path.read_bytes())
+    except OSError:
+        return "stop file present"
+    lines = text.replace("\x00", "").strip().splitlines()
+    return lines[0].strip() if lines else "stop file present"
+
+
 def read_notes(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        return _decode(path.read_bytes())
     except FileNotFoundError:
         return ""
 
@@ -807,6 +1032,9 @@ def write_notes(path: Path, text: str, mode: str = "append") -> int:
     """Save notes and return the file's new length in characters."""
     if mode not in ("append", "replace"):
         raise ControlError("mode must be 'append' or 'replace'.")
+    # Text mode writes each "\n" as the platform's line ending; a "\r\n" passed through
+    # would land on disk as "\r\r\n" on Windows and read back as a blank line.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     path.parent.mkdir(parents=True, exist_ok=True)
     if mode == "replace":
         content = text.rstrip() + "\n"

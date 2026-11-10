@@ -135,26 +135,14 @@ _ALIASES = {
 # Keys that reach outside the game no matter what they are combined with.
 _NEVER = {"super", "win", "windows", "meta", "cmd", "command"}
 
-# Combos the operating system or window manager acts on instead of the game.
-_BLOCKED_COMBOS = {
-    (frozenset({"alt"}), "tab"),
-    (frozenset({"alt"}), "f4"),
-    (frozenset({"alt"}), "escape"),
-    (frozenset({"alt"}), "space"),
-    (frozenset({"alt"}), "enter"),
-    (frozenset({"alt", "shift"}), "tab"),
-    (frozenset({"ctrl"}), "escape"),
-    (frozenset({"ctrl", "shift"}), "escape"),
-    (frozenset({"ctrl", "alt"}), "delete"),
-    (frozenset({"ctrl", "alt"}), "tab"),
-}
+# Combos the operating system or window manager acts on instead of the game. These are
+# rules, not a list of exact combos: Windows still closes the window on ctrl+alt+f4 and
+# still switches task on alt+shift+tab, so an extra modifier must not get a combo through.
+_ALT_SYSTEM_KEYS = {"tab", "f4", "escape", "space", "enter"}
 
-# Kenshi's developer/debug shortcuts. Off unless the operator opts in.
-_DEBUG_COMBOS = {
-    (frozenset({"shift"}), "f12"),  # in-game world editor
-    (frozenset({"ctrl", "shift"}), "f11"),  # rebuild navmesh
-    (frozenset({"shift"}), "f11"),  # reload/fix stuck characters
-}
+# Kenshi's developer/debug shortcuts: shift+f12 (in-game world editor), shift+f11 (fix stuck
+# characters) and ctrl+shift+f11 (rebuild navmesh). Off unless the operator opts in.
+_DEBUG_KEYS = {"f11", "f12"}
 
 
 def normalize_key(name: str) -> str:
@@ -210,16 +198,49 @@ def parse_modifiers(text: str | None) -> list[str]:
     return mods
 
 
-def check_allowed(mods: list[str], key: str, *, allow_debug_keys: bool = False) -> None:
-    """Raise BlockedInput when a combo would act outside the game or trip a debug tool."""
-    signature = (frozenset(mods), key)
-    if signature in _BLOCKED_COMBOS:
+def _spelled(mods: list[str], key: str | None = None) -> str:
+    return "+".join([*mods, key] if key else mods)
+
+
+def check_modifiers(mods: list[str]) -> None:
+    """Raise BlockedInput for modifiers that mean something to Windows when held together.
+
+    Alt+Shift and Ctrl+Shift, pressed and released with no other key, are the Windows
+    shortcuts that switch the input language and keyboard layout. A mouse click in between
+    does not cancel them.
+    """
+    held = set(mods)
+    if "shift" in held and held & {"alt", "ctrl"}:
         raise BlockedInput(
-            f"'{'+'.join([*mods, key])}' is blocked: the operating system handles it, not Kenshi."
+            f"'{_spelled(mods)}' is blocked: held together with no other key, these switch the "
+            "Windows keyboard layout. Shift cannot be combined with ctrl or alt here."
         )
-    if signature in _DEBUG_COMBOS and not allow_debug_keys:
+
+
+def check_allowed(
+    mods: list[str], key: str, *, allow_debug_keys: bool = False, allow_shift_tab: bool = False
+) -> None:
+    """Raise BlockedInput when a combo would act outside the game or trip a debug tool."""
+    held = set(mods)
+    system = (
+        ("alt" in held and key in _ALT_SYSTEM_KEYS)  # switch task, close, window menu, fullscreen
+        or ("ctrl" in held and key == "escape")  # Start menu; with shift, Task Manager
+        or ({"ctrl", "alt"} <= held and key == "delete")
+    )
+    if system:
         raise BlockedInput(
-            f"'{'+'.join([*mods, key])}' is one of Kenshi's debug shortcuts and is disabled. "
+            f"'{_spelled(mods, key)}' is blocked: the operating system handles it, not Kenshi."
+        )
+    if key in MODIFIERS:
+        check_modifiers([*mods, key])
+    if "shift" in held and key == "tab" and not allow_shift_tab:
+        raise BlockedInput(
+            f"'{_spelled(mods, key)}' is blocked: Shift+Tab opens the Steam overlay. "
+            "The operator can enable it with allow_shift_tab in the config."
+        )
+    if "shift" in held and key in _DEBUG_KEYS and not allow_debug_keys:
+        raise BlockedInput(
+            f"'{_spelled(mods, key)}' is one of Kenshi's debug shortcuts and is disabled. "
             "The operator can enable it with allow_debug_keys in the config."
         )
 
@@ -253,3 +274,42 @@ def char_to_key(char: str) -> tuple[str, bool]:
     raise BlockedInput(
         f"Cannot type {char!r}: only US-keyboard ASCII characters can be typed into the game."
     )
+
+
+# The keys that produce characters, by physical position (scancode). Their names are the
+# characters a US layout puts there; another layout puts other characters on the same keys.
+_CHARACTER_KEYS = {
+    definition.scancode: name
+    for name, definition in KEYS.items()
+    if len(name) == 1 or name in (set(_PLAIN.values()) | set(_SHIFTED.values())) - {"space", "enter", "tab"}
+}
+_SAME_ON_EVERY_LAYOUT = " \n\t"
+
+
+def layout_strokes(text: str, lookup) -> list[tuple[str, bool]]:
+    """char_to_key for each character of `text`, on the keyboard layout the game is using.
+
+    `lookup(char)` says where that layout puts a character: (scancode, modifier bits, is it
+    a dead key?), with bit 1 for Shift, 2 for Ctrl and 4 for Alt, or None when the layout
+    has no key for it. That is what the Windows functions VkKeyScanEx and MapVirtualKeyEx
+    report. The result names the physical keys to press, so on a French keyboard "a" comes
+    back as ("q", False): the key a US keyboard labels Q.
+    """
+    strokes = []
+    for char in text:
+        us = char_to_key(char)  # also rejects what is never typed
+        if char in _SAME_ON_EVERY_LAYOUT:
+            strokes.append(us)
+            continue
+        found = lookup(char)
+        if found is None:
+            raise BlockedInput(f"Cannot type {char!r}: the keyboard layout Kenshi is using has no key for it.")
+        scancode, modifiers, dead = found
+        name = _CHARACTER_KEYS.get(scancode)
+        if dead or modifiers & ~1 or name is None:
+            raise BlockedInput(
+                f"Cannot type {char!r}: on the keyboard layout Kenshi is using it needs AltGr, a dead "
+                "key or a key that has no name here, none of which are sent."
+            )
+        strokes.append((name, bool(modifiers & 1)))
+    return strokes

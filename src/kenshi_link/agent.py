@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -196,8 +197,16 @@ class Agent:
     # ---- output -----------------------------------------------------------------
 
     def _say(self, text: str) -> None:
-        if not self.options.quiet:
+        if self.options.quiet:
+            return
+        try:
             print(text, flush=True)
+        except UnicodeEncodeError:
+            # Output redirected to a file or pipe is encoded with the system code page on
+            # Windows, which lacks most of what Claude may write (arrows, CJK, emoji).
+            # The log line is not worth the session: print what the encoding can carry.
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(text.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
 
     def _record(self, kind: str, **fields: Any) -> None:
         if self._transcript is None:
@@ -277,6 +286,7 @@ class Agent:
     async def _run_tool(self, name: str, arguments: dict[str, Any]) -> tuple[list[Any] | str, bool]:
         from anthropic.lib.tools.mcp import mcp_content
 
+        _let_the_server_take_focus()
         try:
             result = await self.session.call_tool(name, arguments)
         except Exception as exc:  # transport failure, not a tool error
@@ -423,8 +433,66 @@ class Agent:
                 rollover_at = None
 
 
-async def play(options: AgentOptions, server_env: dict[str, str] | None = None) -> Outcome:
-    """Start the MCP server as a child process and let Claude play until the session ends."""
+def _let_the_server_take_focus() -> None:
+    """Pass this process's right to change the front window on to the server.
+
+    Windows only lets the program the user last worked in bring a window forward. That
+    is this process (started from the console the user typed into), not the server, which
+    the MCP SDK starts detached from any console. Where this process has no such right
+    the call does nothing, and where the game is already in front none is needed.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)  # ASFW_ANY
+    except Exception:
+        pass
+
+
+def _bring_game_forward(config: Config) -> None:
+    """Put Kenshi in front from this process, before the server exists (see above)."""
+    if sys.platform != "win32" or not config.auto_focus or config.backend not in ("auto", "windows"):
+        return
+    try:
+        from .backends import create_backend
+
+        backend = create_backend(config)
+        try:
+            if not backend.locate().focused:
+                backend.focus()
+        finally:
+            backend.close()
+    except Exception:
+        pass  # the server meets the same problem and reports it in words Claude can use
+
+
+async def _pause_at_the_end(session: Any) -> str:
+    """Pause the game as the session closes, and say in a sentence how that went."""
+    try:
+        result = await asyncio.wait_for(session.call_tool("set_speed", {"speed": "pause"}), timeout=20)
+    except Exception as exc:
+        return (
+            f"The game could not be reached to pause it ({type(exc).__name__}), so it may still be "
+            "running: check it."
+        )
+    text = "\n".join(getattr(item, "text", "") for item in result.content).strip()
+    if _attr(result, "is_error", "isError"):
+        reason = text.splitlines()[0] if text else "no reason given"
+        return f"The game was not paused and may still be running: {reason}"
+    return "The game is paused."
+
+
+async def play(
+    options: AgentOptions,
+    server_env: dict[str, str] | None = None,
+    on_close: Callable[[str], None] | None = None,
+) -> Outcome:
+    """Start the MCP server as a child process and let Claude play until the session ends.
+
+    `on_close` is told, in a sentence, what state the game was left in.
+    """
     try:
         import anthropic
     except ImportError as exc:
@@ -434,21 +502,27 @@ async def play(options: AgentOptions, server_env: dict[str, str] | None = None) 
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
-    config = load_config()
+    environment = {**os.environ, **(server_env or {})}
+    config = load_config(env=environment)
     if options.transcript is None:
         options.transcript = config.sessions_dir / f"agent-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     client = anthropic.AsyncAnthropic(max_retries=4)
     parameters = StdioServerParameters(
-        command=sys.executable, args=["-m", "kenshi_link.server"], env={**os.environ, **(server_env or {})}
+        command=sys.executable, args=["-m", "kenshi_link.server"], env=environment
     )
-    async with stdio_client(parameters) as (read, write):
+    _bring_game_forward(config)
+    # errlog is named so that it is today's sys.stderr, not the one the SDK saw when imported.
+    async with stdio_client(parameters, errlog=sys.stderr) as (read, write):
         async with ClientSession(read, write) as session:
             agent = Agent(client, session, options, config)
             try:
                 return await agent.run()
             finally:
-                # Whatever happened, do not leave the game running unattended.
+                # Whatever happened, do not leave the game running unattended. An advance
+                # still in progress in the server is cut short by this call.
+                state = "The session was cut off before the game could be paused: check whether it is running."
                 try:
-                    await asyncio.wait_for(session.call_tool("set_speed", {"speed": "pause"}), timeout=20)
-                except Exception:
-                    pass
+                    state = await _pause_at_the_end(session)
+                finally:
+                    if on_close is not None:
+                        on_close(state)

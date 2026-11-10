@@ -36,8 +36,8 @@ disagree, fix the belief with sync_pause.
 
 Limits
 - Input is sent only while the Kenshi window has focus, and only keys that stay inside the game.
-- If a result starts with KENSHI_LINK_HALTED, the operator has stopped the session. Stop calling \
-game tools and tell them what you were doing.
+- If a result contains KENSHI_LINK_HALTED, the operator has stopped the session or their PC is \
+locked. Stop calling game tools and tell them what you were doing.
 - Loading a save discards progress since the last save; make sure that is what you want.
 
 Memory
@@ -156,8 +156,15 @@ call sync_pause with the real state, then set_speed("pause") if the game is runn
 or covered. Tell the operator; it must run windowed or borderless.
 - "not the focused window": the operator clicked elsewhere. Try once more (the tool tries to \
 refocus the game); if it still fails, ask the operator to click on the game.
-- A long load or a loading screen: use advance or wait a few seconds and observe again. After \
-a load the game may come back paused; observe re-checks this.
+- "Another window is covering the game": a notification or some other window lies over the \
+spot you aimed at, and the click was not sent. Observe to see it; notifications go away by \
+themselves, otherwise aim beside it or tell the operator.
+- "Kenshi is not responding": the game is busy loading or saving and nothing was sent. Observe \
+again after a moment, and keep trying for a minute or two before telling the operator.
+- A loading screen that does respond: use advance, or wait a few seconds and observe again. \
+After a load the game may come back paused; observe re-checks this.
+- type_text refused a character, or says Caps Lock is on: the operator's keyboard layout \
+cannot produce that character plainly. Use a simpler name.
 - You are lost in menus: hotkey("close") backs out one window at a time. If the main menu \
 opens, press it again to close it.
 """,

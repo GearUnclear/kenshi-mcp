@@ -13,8 +13,9 @@ Early. It was built and tested on a machine without the game:
 
 - The controller, the MCP server and the unattended runner are covered by tests against a
   stand-in window and a scripted API.
-- The Windows input and capture code passes its self-test under Wine. The Linux/X11 code is
-  tested against a real X server.
+- The whole test suite and the Windows self-test pass on Windows Python under Wine, including
+  the MCP server and the runner driving a real Win32 window. The Linux/X11 code is tested
+  against a real X server.
 - It has not yet been run against Kenshi itself, on native Windows, or against the live
   Claude API.
 
@@ -125,16 +126,21 @@ See `kenshi-link play --help` for the other options. Transcripts are written to
 
 Any of these disables all input until you allow it again:
 
-- Push the mouse into the top-left corner of the primary screen and hold it there.
+- Push the mouse into the top-left corner of the screen (the leftmost one, if you have several).
 - Run `kenshi-link stop` from another PowerShell window.
-- Hold Pause/Break, if your keyboard has it.
+- Tap Pause/Break, if your keyboard has it.
 
-A stop takes effect at Claude's next action, or within moments while the game clock is
-running. `kenshi-link resume` allows input again.
+A stop takes effect within moments, including in the middle of typing, a drag or a held key.
+`kenshi-link resume` allows input again.
 
-Other guard rails: input is only sent while the Kenshi window has focus, pointer positions are
-confined to the window, and key combinations that leave the game (the Windows key, Alt+Tab,
-Alt+F4 and similar) are refused, as are Kenshi's debug shortcuts.
+Other guard rails:
+
+- Input is only sent while the Kenshi window has focus, and pointer positions are confined to
+  the window.
+- A click is refused where another window, such as a notification, covers the game.
+- Key combinations that leave the game (the Windows key, Alt+Tab, Alt+F4, Shift+Tab for the
+  Steam overlay and similar) are refused, as are Kenshi's debug shortcuts.
+- If Kenshi is running as administrator and this is not, it says so instead of failing silently.
 
 ## Tools
 

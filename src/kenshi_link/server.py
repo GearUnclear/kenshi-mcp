@@ -80,16 +80,41 @@ class _Session:
             raise ToolError(f"Internal error in kenshi-link ({type(exc).__name__}: {exc}).") from exc
 
     async def run(self, method: str, *args: Any, **kwargs: Any) -> list[Any]:
+        if method == "set_speed" and args[:1] == ("pause",) and self._controller is not None:
+            # Calls queue up behind one another, and an advance can last minutes. A pause
+            # must not wait its turn: tell the advance in progress to stop and pause now.
+            self._controller.request_pause()
         result = await self._on_worker(self._call, method, args, kwargs)
         return [result.text, *(Image(data=shot.data, format=shot.format) for shot in result.images)]
 
     async def run_plain(self, function, *args: Any) -> Any:
         return await self._on_worker(function, *args)
 
+    def close(self, timeout: float = 1.5) -> None:
+        """Stop what is in progress, pause a running advance and let go of every key.
 
-def build_server(config: Config | None = None, controller: Controller | None = None) -> MCPServer:
+        Called when the client has gone (its end of stdin closed) or the server is told
+        to exit. MCP clients give a server about two seconds before killing it, and a key
+        still held down at that point stays down for the whole desktop.
+        """
+        controller = self._controller
+        if controller is not None:
+            controller.shutdown()
+            try:
+                self._pool.submit(controller.close).result(timeout)
+            except Exception:  # the worker is stuck or the backend is broken
+                try:
+                    controller.release_held()
+                except Exception:
+                    pass
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def build_server(
+    config: Config | None = None, controller: Controller | None = None, session: _Session | None = None
+) -> MCPServer:
     config = config or load_config()
-    session = _Session(config, controller)
+    session = session or _Session(config, controller)
     server = MCPServer("kenshi-link", instructions=INSTRUCTIONS)
     tool = functools.partial(server.tool, structured_output=False)
 
@@ -132,7 +157,7 @@ def build_server(config: Config | None = None, controller: Controller | None = N
         y: Annotated[float, Field(description="Y in screenshot pixels.")],
         button: Annotated[Button, Field(description="Mouse button.")] = "left",
         modifiers: Annotated[
-            str, Field(description="Keys held during the click: '', 'shift', 'ctrl', 'alt' or e.g. 'ctrl+shift'.")
+            str, Field(description="Key held during the click: '', 'shift', 'ctrl' or 'alt'.")
         ] = "",
         count: Annotated[int, Field(description="1 for a click, 2 for a double-click.", ge=1, le=3)] = 1,
         hold_seconds: Annotated[
@@ -200,7 +225,7 @@ def build_server(config: Config | None = None, controller: Controller | None = N
 
     @tool()
     async def type_text(
-        text: Annotated[str, Field(description="Text to type (US-keyboard characters, up to 200).")],
+        text: Annotated[str, Field(description="Text to type (plain ASCII characters, up to 200).")],
     ) -> list:
         """Type text into the text box that currently has focus in the game.
 
@@ -348,8 +373,13 @@ def build_server(config: Config | None = None, controller: Controller | None = N
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="kenshi-link: %(message)s")
-    server = build_server()
-    server.run()
+    config = load_config()
+    session = _Session(config)
+    server = build_server(config, session=session)
+    try:
+        server.run()
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":
