@@ -392,3 +392,34 @@ def test_notes_append_and_replace(tmp_path):
     assert read_notes(notes) == "fresh\n"
     with pytest.raises(ControlError):
         write_notes(notes, "x", mode="prepend")
+
+
+# ---- the guide -------------------------------------------------------------------------
+
+
+def test_the_guide_stays_short_and_points_to_the_reference():
+    from kenshi_link.manual import INSTRUCTIONS, TOPICS, manual
+
+    # The instructions go to the model on every turn and "controls" is read at every start:
+    # facts about the game belong in the reference, which costs nothing until asked for.
+    assert len(INSTRUCTIONS) <= 2900 and all(len(text) <= 3100 for text in TOPICS.values())
+    assert sum(map(len, TOPICS.values())) + len(INSTRUCTIONS) <= 11500
+    assert "lookup(query)" in INSTRUCTIONS and "lookup_topics" in INSTRUCTIONS
+    assert all("lookup" in text for text in TOPICS.values()), "every topic says where the detail is"
+    assert list(TOPICS) == ["controls", "screen", "play", "troubleshooting"]
+    assert manual(" Controls ") == TOPICS["controls"] and "Manual topics: controls" in manual("")
+    with pytest.raises(KeyError, match="No manual topic"):
+        manual("cheats")
+
+
+def test_the_guide_describes_the_tools_as_they_now_work():
+    from kenshi_link.manual import INSTRUCTIONS, TOPICS
+
+    guide = INSTRUCTIONS + "".join(TOPICS.values())
+    for current in ("menu_open(x, y)", "menu_choose(x, y)", "menu_cancel()", 'hotkey("close", in_game=true)',
+                    "sync_pause(paused=false)", "PAUSED panel", 'modifiers="alt"'):
+        assert current in guide, current
+    # What research showed to be wrong: a menu that outlives the button, Escape as a plain
+    # "back" key, and choosing from the menu by dragging blind.
+    for outdated in ("hold_seconds", 'hotkey("close")', 'drag(button="right")', "one window at a time"):
+        assert outdated not in guide, outdated
